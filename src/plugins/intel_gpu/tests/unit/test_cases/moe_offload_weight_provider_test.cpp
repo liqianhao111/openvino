@@ -86,6 +86,21 @@ TEST(moe_expert_weight_provider, offload_try_acquire_simultaneous_capacity_overf
     ASSERT_FALSE(lease.has_value());
 }
 
+TEST(moe_expert_weight_provider, offload_capacity_overflow_does_not_load_or_mutate_cache) {
+    MOECompressed::Config config{};
+    OffloadExpertWeightProvider provider(/*capacity=*/2, config, {0, 100, 200, 300}, "/nonexistent");
+
+    cldnn::moe_weights resident{};
+    provider.bind(resident);
+
+    // The first two experts miss. Rejecting only after acquiring them would attempt file I/O.
+    const std::vector<uint32_t> experts = {7, 3, 5, 7};
+    auto lease = provider.try_acquire_simultaneous(experts, get_test_stream());
+
+    ASSERT_FALSE(lease.has_value());
+    EXPECT_EQ(provider.cache().size(), 0U);
+}
+
 TEST(moe_expert_weight_provider, offload_try_acquire_simultaneous_within_capacity) {
     // Same setup but with only 2 unique experts -> should succeed
     MOECompressed::Config config{};

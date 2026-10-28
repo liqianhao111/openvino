@@ -59,6 +59,26 @@ using namespace ov::intel_gpu::ocl;
 using cldnn::onednn::onednn_linear;
 using cldnn::onednn::onednn_matmul;
 
+class ScopedOtdTimer {
+public:
+    explicit ScopedOtdTimer(std::atomic<uint64_t>* counter) : _counter(counter), _start(std::chrono::steady_clock::now()) {}
+
+    ~ScopedOtdTimer() {
+        if (_counter) {
+            const auto elapsed = std::chrono::steady_clock::now() - _start;
+            _counter->fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                                std::memory_order_relaxed);
+        }
+    }
+
+    ScopedOtdTimer(const ScopedOtdTimer&) = delete;
+    ScopedOtdTimer& operator=(const ScopedOtdTimer&) = delete;
+
+private:
+    std::atomic<uint64_t>* _counter;
+    std::chrono::steady_clock::time_point _start;
+};
+
 dnnl::memory::data_type convert_data_type(cldnn::data_types dt) {
     switch (dt) {
     case cldnn::data_types::f32:
@@ -697,6 +717,8 @@ public:
                                 typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
                                 scratch_buffers& scratch,
                                 const std::vector<size_t>& lease) {
+        auto* perf = moe_otd::get_perf_counters();
+        ScopedOtdTimer index_write_timer(perf ? &perf->index_write_ns : nullptr);
         const size_t topk_bytes = lease.size() * sizeof(uint32_t);
         if (!_otd_expert_index_buffer || _otd_expert_index_buffer->size() < topk_bytes) {
             auto& engine = instance.get_network().get_engine();
@@ -789,10 +811,20 @@ public:
             needs_fallback = false;
             return;
         }
-        stream.finish();
+        auto* perf = moe_otd::get_perf_counters();
+        ScopedOtdTimer prepare_timer(perf ? &perf->batched_gemv_prepare_ns : nullptr);
+        const auto top_k = static_cast<size_t>(instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config.top_k);
+        OPENVINO_ASSERT(top_k > 0 && topk_count % top_k == 0, "Invalid top-k count for OTD route readback");
+        {
+            ScopedOtdTimer finish_timer(perf ? &perf->finish_wait_ns : nullptr);
+            stream.finish();
+        }
 
         std::vector<uint32_t> expert_ids(topk_count);
-        scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
+        {
+            ScopedOtdTimer readback_timer(perf ? &perf->topk_readback_ns : nullptr);
+            scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
+        }
 
         auto lease = _weight_provider->try_acquire_simultaneous(expert_ids, stream);
         if (!lease) {
@@ -803,6 +835,7 @@ public:
             return;
         }
 
+        moe_otd::record_route_trace(instance.id(), topk_count / top_k, top_k, expert_ids);
         write_otd_expert_slots(stream, instance, scratch, *lease);
         set_otd_weight_pointers(instance, scratch);
         needs_fallback = false;
@@ -820,7 +853,11 @@ public:
         }
 
         std::vector<uint32_t> expert_ids(topk_count);
-        batch_mem_ptr->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
+        {
+            auto* perf = moe_otd::get_perf_counters();
+            ScopedOtdTimer readback_timer(perf ? &perf->topk_readback_ns : nullptr);
+            batch_mem_ptr->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
+        }
 
         auto lease = _weight_provider->try_acquire_simultaneous(expert_ids, stream);
         if (!lease) {
@@ -831,6 +868,9 @@ public:
             return;
         }
 
+        const auto top_k = static_cast<size_t>(instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config.top_k);
+        OPENVINO_ASSERT(top_k > 0 && topk_count % top_k == 0, "Invalid top-k count for OTD route readback");
+        moe_otd::record_route_trace(instance.id(), topk_count / top_k, top_k, expert_ids);
         write_otd_expert_slots(stream, instance, scratch, *lease);
         batch_mem_ptr = scratch._expert_index_buffer;
         needs_fallback = false;
@@ -891,11 +931,18 @@ public:
             return false;
         }
 
-        stream.finish();  // ensure routing kernel has written topk_ids
+        auto* perf = moe_otd::get_perf_counters();
+        {
+            ScopedOtdTimer finish_timer(perf ? &perf->finish_wait_ns : nullptr);
+            stream.finish();  // ensure routing kernel has written topk_ids
+        }
 
         size_t topk_count = static_cast<size_t>(token_num) * max_topk;
         std::vector<uint32_t> raw_topk_ids(topk_count);
-        batch_mem_ptr->copy_to(stream, raw_topk_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
+        {
+            ScopedOtdTimer readback_timer(perf ? &perf->topk_readback_ns : nullptr);
+            batch_mem_ptr->copy_to(stream, raw_topk_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
+        }
 
         // Use lease API for capacity-safe simultaneous acquisition.
         // If unique experts exceed resident capacity, returns nullopt → caller falls back.
@@ -908,6 +955,8 @@ public:
             }
             return false;  // Caller checks is_offloaded() to distinguish from non-OTD
         }
+
+        moe_otd::record_route_trace(instance.id(), token_num, static_cast<size_t>(max_topk), raw_topk_ids);
 
         // Remap using lease slots
         std::vector<uint32_t> remapped(topk_count);
@@ -1437,7 +1486,12 @@ public:
         prepare_weight_pointers(instance, scratch);
     }
 
-    void get_expert_mask_from_gpu(const MOECompressed::Config& config, memory::ptr mem, stream& stream, expert_mask_cpu& expert_mask, size_t actual_token_num) {
+    void get_expert_mask_from_gpu(const MOECompressed::Config& config,
+                                  memory::ptr mem,
+                                  stream& stream,
+                                  expert_mask_cpu& expert_mask,
+                                  size_t actual_token_num,
+                                  const std::string& primitive_id = {}) {
         // shape: [token_num, topk]
         auto layout = mem->get_layout();
 
@@ -1452,7 +1506,19 @@ public:
         GPU_DEBUG_TRACE_DETAIL << "[DEBUG] get_expert_mask_from_gpu: max_expert_num=" << max_expert_num << ", max_topk=" << max_topk
                                << ", max_tokens=" << max_tokens << std::endl;
         std::vector<int32_t> buf(max_topk * max_tokens);
-        mem->copy_to(stream, buf.data(), 0, 0, buf.size() * sizeof(int32_t), true);
+        {
+            auto* perf = moe_otd::get_perf_counters();
+            ScopedOtdTimer readback_timer(perf ? &perf->topk_readback_ns : nullptr);
+            mem->copy_to(stream, buf.data(), 0, 0, buf.size() * sizeof(int32_t), true);
+        }
+        if (!primitive_id.empty() && std::getenv("MOE_OTD_TRACE")) {
+            std::vector<uint32_t> route_ids(buf.size());
+            for (size_t i = 0; i < buf.size(); ++i) {
+                OPENVINO_ASSERT(buf[i] >= 0, "Negative expert ID in MoE router output: ", buf[i]);
+                route_ids[i] = static_cast<uint32_t>(buf[i]);
+            }
+            moe_otd::record_route_trace(primitive_id, actual_token_num, static_cast<size_t>(max_topk), route_ids);
+        }
 
         for (int b = 0; b < max_tokens; b++) {
             auto* tok_p = &buf[b * max_topk];
@@ -1589,7 +1655,7 @@ public:
             if (needs_fallback) {
                 // Cannot fit all experts simultaneously → fall back to per-expert onednn loop
                 instance.output_memory_ptr(0)->fill(stream, 0u);
-                return exec_prefill_onednn(events, stream, instance, scratch);
+                return exec_prefill_onednn_fallback(events, stream, instance, scratch);
             }
         }
         // OTD hook may have remapped expert IDs into scratch._expert_index_buffer
@@ -1730,7 +1796,7 @@ public:
             on_before_prefill(stream, instance, scratch, batch_mem_ptr, topk_count, needs_fallback);
             if (needs_fallback) {
                 instance.output_memory_ptr(0)->fill(stream, 0u);
-                return exec_prefill_onednn(events, stream, instance, scratch);
+                return exec_prefill_onednn_fallback(events, stream, instance, scratch);
             }
         }
 
@@ -2255,7 +2321,7 @@ public:
         auto topk_id_mem = scratch.topk_id;
         auto token_num = get_seq_len(hidden_states_layout);
         expert_mask_cpu expert_mask;
-        get_expert_mask_from_gpu(config, topk_id_mem, stream, expert_mask, token_num);
+        get_expert_mask_from_gpu(config, topk_id_mem, stream, expert_mask, token_num, instance.id());
 
         for (size_t expert_no = 0; expert_no < config.num_expert; expert_no++) {
             if (expert_no >= expert_mask.pred_flag.size()) {
@@ -2323,6 +2389,18 @@ public:
         }
 
         return result_event;
+    }
+
+    cldnn::event::ptr exec_prefill_onednn_fallback(const std::vector<cldnn::event::ptr>& events,
+                                                   cldnn::stream& stream,
+                                                   typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                                                   scratch_buffers& scratch) {
+        auto* perf = moe_otd::get_perf_counters();
+        if (perf) {
+            perf->prefill_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
+        ScopedOtdTimer fallback_timer(perf ? &perf->prefill_fallback_ns : nullptr);
+        return exec_prefill_onednn(events, stream, instance, scratch);
     }
 
     // Third prefill path: OneDNN grouped GEMM (one matmul call per GEMM layer, all experts together).
@@ -2402,7 +2480,7 @@ public:
                                     events)) {
             if (_weight_provider->is_offloaded()) {
                 // OTD: unique experts > capacity → explicit fallback to per-expert loop
-                return exec_prefill_onednn(events, stream, instance, scratch);
+                return exec_prefill_onednn_fallback(events, stream, instance, scratch);
             }
             // Non-OTD path: build mask from original expert IDs
             expert_mask_cpu expert_mask;
@@ -2585,6 +2663,11 @@ public:
         auto& stream = cur_net.get_stream();
 
         OPENVINO_ASSERT(_weight_provider, "expert weight provider not initialized");
+        if (_weight_provider->is_offloaded()) {
+            if (auto* perf = moe_otd::get_perf_counters()) {
+                perf->moe_executions.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
 
         cldnn::event::ptr ret_env = nullptr;
         _has_shared_expert = (config.num_shared_expert > 0);

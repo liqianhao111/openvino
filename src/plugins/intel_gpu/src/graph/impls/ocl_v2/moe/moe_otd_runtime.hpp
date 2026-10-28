@@ -22,20 +22,34 @@ namespace ov::intel_gpu::ocl::moe_otd {
 // Enabled by setting MOE_OTD_PERF_LOG=1 environment variable.
 // Counters are printed to stderr on process exit.
 struct OtdPerfCounters {
+    std::atomic<uint64_t> moe_executions{0};
     std::atomic<uint64_t> gpu_hits{0};
     std::atomic<uint64_t> gpu_misses{0};
     std::atomic<uint64_t> disk_io_ns{0};
     std::atomic<uint64_t> transpose_ns{0};
     std::atomic<uint64_t> gpu_copy_ns{0};
+    std::atomic<uint64_t> finish_wait_ns{0};
+    std::atomic<uint64_t> topk_readback_ns{0};
+    std::atomic<uint64_t> index_write_ns{0};
+    std::atomic<uint64_t> batched_gemv_prepare_ns{0};
     std::atomic<uint64_t> tensor_load_count{0};
     std::atomic<uint64_t> batched_fallbacks{0};
     std::atomic<uint64_t> grouped_fallbacks{0};
+    std::atomic<uint64_t> prefill_fallbacks{0};
+    std::atomic<uint64_t> prefill_fallback_ns{0};
     std::atomic<uint64_t> created_onednn_kernels{0};
 
     void dump() const;
 };
 
 OtdPerfCounters* get_perf_counters();
+
+// When MOE_OTD_TRACE is set, appends one text line per token: "step layer token e0,e1,...".
+// layer is assigned in first-execution order; step advances each time layer 0 runs again.
+void record_route_trace(const std::string& primitive_id,
+                        size_t token_num,
+                        size_t top_k,
+                        const std::vector<uint32_t>& expert_ids);
 
 class ParallelWeightReader {
 public:

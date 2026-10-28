@@ -8,26 +8,37 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iostream>
 #include <limits>
-
-#include "intel_gpu/runtime/debug_configuration.hpp"
+#include <mutex>
+#include <unordered_map>
 
 namespace ov::intel_gpu::ocl::moe_otd {
 
 void OtdPerfCounters::dump() const {
+    const auto executions = moe_executions.load(std::memory_order_relaxed);
     const auto hits = gpu_hits.load(std::memory_order_relaxed);
     const auto misses = gpu_misses.load(std::memory_order_relaxed);
     const auto total = hits + misses;
     const auto loads = tensor_load_count.load(std::memory_order_relaxed);
-    GPU_DEBUG_INFO << "[OTD_PERF] gpu_hits=" << hits << ", gpu_misses=" << misses << ", gpu_hit_rate=" << (total > 0 ? 100.0 * hits / total : 0.0) << "%"
-                   << ", tensor_loads=" << loads << ", avg_disk_io_us=" << (loads > 0 ? disk_io_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
-                   << ", avg_transpose_us=" << (loads > 0 ? transpose_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
-                   << ", avg_gpu_copy_us=" << (loads > 0 ? gpu_copy_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
-                   << ", total_disk_io_ms=" << disk_io_ns.load(std::memory_order_relaxed) / 1000000
-                   << ", total_gpu_copy_ms=" << gpu_copy_ns.load(std::memory_order_relaxed) / 1000000
-                   << ", batched_fallbacks=" << batched_fallbacks.load(std::memory_order_relaxed)
-                   << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
-                   << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed) << std::endl;
+    std::cerr << "[OTD_PERF] moe_executions=" << executions << ", gpu_hits=" << hits << ", gpu_misses=" << misses
+              << ", gpu_hit_rate=" << (total > 0 ? 100.0 * hits / total : 0.0) << "%"
+              << ", tensor_loads=" << loads << ", avg_disk_io_us=" << (loads > 0 ? disk_io_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
+              << ", avg_transpose_us=" << (loads > 0 ? transpose_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
+              << ", avg_gpu_copy_us=" << (loads > 0 ? gpu_copy_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
+              << ", finish_wait_ms=" << finish_wait_ns.load(std::memory_order_relaxed) / 1000000
+              << ", topk_readback_ms=" << topk_readback_ns.load(std::memory_order_relaxed) / 1000000
+              << ", index_write_ms=" << index_write_ns.load(std::memory_order_relaxed) / 1000000
+              << ", batched_gemv_prepare_ms=" << batched_gemv_prepare_ns.load(std::memory_order_relaxed) / 1000000
+              << ", prefill_fallbacks=" << prefill_fallbacks.load(std::memory_order_relaxed)
+              << ", prefill_fallback_ms=" << prefill_fallback_ns.load(std::memory_order_relaxed) / 1000000
+              << ", total_disk_io_ms=" << disk_io_ns.load(std::memory_order_relaxed) / 1000000
+              << ", total_transpose_ms=" << transpose_ns.load(std::memory_order_relaxed) / 1000000
+              << ", total_gpu_copy_ms=" << gpu_copy_ns.load(std::memory_order_relaxed) / 1000000
+              << ", batched_fallbacks=" << batched_fallbacks.load(std::memory_order_relaxed)
+              << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
+              << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed) << std::endl;
 }
 
 OtdPerfCounters* get_perf_counters() {
@@ -45,6 +56,82 @@ OtdPerfCounters* get_perf_counters() {
     }();
     (void)registered;
     return &counters;
+}
+
+namespace {
+
+class RouteTraceWriter {
+public:
+    RouteTraceWriter() {
+        const char* path = std::getenv("MOE_OTD_TRACE");
+        if (path && *path) {
+            _output.open(path, std::ios::app);
+            if (_output) {
+                _output << "# step layer token experts\n";
+            } else {
+                std::cerr << "[OTD_TRACE] failed to open route trace file: " << path << std::endl;
+            }
+        }
+    }
+
+    void append(const std::string& primitive_id,
+                size_t token_num,
+                size_t top_k,
+                const std::vector<uint32_t>& expert_ids) {
+        if (!_output) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto [it, inserted] = _layer_indices.emplace(primitive_id, static_cast<uint32_t>(_layer_indices.size()));
+        (void)inserted;
+        if (it->second == 0) {
+            if (_has_step) {
+                ++_step;
+            } else {
+                _has_step = true;
+            }
+        }
+
+        const auto layer = it->second;
+        for (size_t t = 0; t < token_num; ++t) {
+            _output << _step << ' ' << layer << ' ' << t;
+            for (size_t k = 0; k < top_k; ++k) {
+                _output << (k == 0 ? ' ' : ',') << expert_ids[t * top_k + k];
+            }
+            _output << '\n';
+        }
+        _output.flush();
+        if (!_output) {
+            std::cerr << "[OTD_TRACE] failed while writing route trace record" << std::endl;
+            _output.close();
+        }
+    }
+
+private:
+    std::mutex _mutex;
+    std::ofstream _output;
+    std::unordered_map<std::string, uint32_t> _layer_indices;
+    uint64_t _step = 0;
+    bool _has_step = false;
+};
+
+}  // namespace
+
+void record_route_trace(const std::string& primitive_id,
+                        size_t token_num,
+                        size_t top_k,
+                        const std::vector<uint32_t>& expert_ids) {
+    const char* path = std::getenv("MOE_OTD_TRACE");
+    if (!path || !*path) {
+        return;
+    }
+    if (top_k == 0 || token_num > std::numeric_limits<size_t>::max() / top_k || expert_ids.size() != token_num * top_k) {
+        std::cerr << "[OTD_TRACE] invalid expert ID count; skipping route record" << std::endl;
+        return;
+    }
+    static RouteTraceWriter writer;
+    writer.append(primitive_id, token_num, top_k, expert_ids);
 }
 
 void maybe_transpose_scale_zp(const cldnn::MOECompressed::Config& config,

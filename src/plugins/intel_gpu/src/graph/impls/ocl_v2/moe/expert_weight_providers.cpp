@@ -5,6 +5,7 @@
 #include "expert_weight_providers.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 // moe_otd_runtime.hpp is not self-contained: it relies on cldnn graph/runtime
@@ -58,9 +59,18 @@ void OffloadExpertWeightProvider::fill_routed_weight_views(cldnn::moe_weights& /
 }
 
 std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& stream) {
-    // Deduplicate to check capacity
+    // Reject oversized batches before touching the LRU or reading any weights.
+    std::unordered_set<uint32_t> unique_experts;
+    unique_experts.reserve(experts.size());
+    for (const uint32_t expert : experts) {
+        unique_experts.insert(expert);
+        if (unique_experts.size() > _capacity) {
+            return std::nullopt;
+        }
+    }
+
     std::unordered_map<uint32_t, size_t> expert_to_slot;
-    expert_to_slot.reserve(experts.size());
+    expert_to_slot.reserve(unique_experts.size());
 
     std::vector<size_t> slots(experts.size());
     auto* perf = moe_otd::get_perf_counters();
@@ -71,11 +81,6 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
         if (it != expert_to_slot.end()) {
             slots[i] = it->second;
             continue;
-        }
-
-        // Check if we would exceed capacity
-        if (expert_to_slot.size() >= _capacity) {
-            return std::nullopt;
         }
 
         const auto item = _cache->get_lru_item(expert);

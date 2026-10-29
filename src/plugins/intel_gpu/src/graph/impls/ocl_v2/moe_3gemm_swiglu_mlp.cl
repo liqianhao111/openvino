@@ -41,6 +41,15 @@
 #define EXPERTS_PER_TOKEN MAX_TOPK
 #endif
 
+#if MOE_OTD_SPLIT
+// OTD index buffer: token_num * MAX_TOPK slots (-1 = computed in the other pass), then token_num shared-expert flags.
+// The whole work-group shares one (token, expert) pair, so returning early cannot strand a barrier.
+// A macro, not a function: gate_up and down are built into one program.
+#    define MOE_OTD_SKIP(expert_list, token_idx, expert_slot, is_shared)                                    \
+        ((is_shared) ? (expert_list[(int)(get_global_size(0) / EXPERTS_PER_TOKEN) * MAX_TOPK + (token_idx)] == 0) \
+                     : (expert_list[(token_idx) * MAX_TOPK + (expert_slot)] < 0))
+#endif
+
 // Gate activation: SwiGLU (Swish, default), GeGLU-Tanh, or GeGLU-ERF.
 // GATE_ACT_GELU_ERF takes precedence over GATE_ACT_GELU_TANH when both are set.
 #ifdef GATE_ACT_GELU_ERF
@@ -469,6 +478,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
     bool is_shared = (expert_slot == MAX_TOPK);
 #    else
     bool is_shared = false;
+#    endif
+
+#    if MOE_OTD_SPLIT
+    if (MOE_OTD_SKIP(expert_list, token_idx, expert_slot, is_shared)) {
+        return;
+    }
 #    endif
 
 #    if WEIGHT_COMPRESSEION_DT == 0
@@ -994,6 +1009,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
     bool is_shared = (expert_slot == MAX_TOPK);
 #    else
     bool is_shared = false;
+#    endif
+
+#    if MOE_OTD_SPLIT
+    if (MOE_OTD_SKIP(expert_list, token_idx, expert_slot, is_shared)) {
+        return;
+    }
 #    endif
 
 #    if WEIGHT_COMPRESSEION_DT == 0

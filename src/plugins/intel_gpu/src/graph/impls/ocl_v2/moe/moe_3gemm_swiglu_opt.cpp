@@ -11,6 +11,7 @@
 #include "expert_weight_providers.hpp"
 // clang-format on
 
+using ov::intel_gpu::ocl::moe::ExpertRequest;
 using ov::intel_gpu::ocl::moe::IExpertWeightProvider;
 using ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider;
 using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
@@ -21,6 +22,7 @@ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
 #    include <algorithm>
 #    include <chrono>
 #    include <cstdint>
+#    include <cstring>
 #    include <fstream>
 #    include <initializer_list>
 #    include <iostream>
@@ -28,6 +30,7 @@ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
 #    include <mutex>
 #    include <oneapi/dnnl/dnnl.hpp>
 #    include <oneapi/dnnl/dnnl_ocl.hpp>
+#    include <optional>
 #    include <sstream>
 #    include <string_view>
 #    include <thread>
@@ -453,6 +456,7 @@ static void add_common_consts(const RuntimeParams& params, JitConstants& jit) {
     jit.make("MOE_DTYPE", params.get_input_layout(0).data_type == ov::element::f16 ? "half" : "float");
     jit.make("MOE_DTYPE_SIZE", params.get_input_layout(0).data_type == ov::element::f16 ? 2 : 4);
     jit.make("HAS_ZP", desc->_config.has_zp ? 1 : 0);
+    jit.make("MOE_OTD_SPLIT", desc->_otd.lru_expert_num > 0 ? 1 : 0);
 
     ov::element::Type weight_dt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_0)).data_type;
     bool is_signed_weight = (weight_dt == ov::element::i4 || weight_dt == ov::element::i8);
@@ -691,37 +695,49 @@ public:
     std::shared_ptr<IExpertWeightProvider> _weight_provider;
     // Owned by the impl: kernels reading it may still be in flight after execute() returns.
     memory::ptr _otd_expert_index_buffer;
+    // Second-pass index of a split batched GEMV; written while the first pass still reads the buffer above.
+    memory::ptr _otd_expert_index_buffer_pass2;
 
     // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
+
+    // Callers drain every kernel that reads `buffer` first (finish or blocking topk readback).
+    void write_otd_index(cldnn::stream& stream,
+                         typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                         memory::ptr& buffer,
+                         const std::vector<int32_t>& values) {
+        auto* perf = moe_otd::get_perf_counters();
+        ScopedOtdTimer index_write_timer(perf ? &perf->index_write_ns : nullptr);
+        const size_t bytes = values.size() * sizeof(int32_t);
+        if (!buffer || buffer->size() < bytes) {
+            auto& engine = instance.get_network().get_engine();
+            auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(bytes)}, ov::element::i8, cldnn::format::bfyx);
+            buffer = engine.allocate_memory(layout, allocation_type::usm_host, false);
+        }
+        const bool host_writable =
+            buffer->get_allocation_type() == allocation_type::usm_host && stream.get_queue_type() == ov::intel_gpu::QueueTypes::in_order;
+        if (host_writable) {
+            std::memcpy(buffer->buffer_ptr(), values.data(), bytes);
+        } else {
+            buffer->copy_from(stream, values.data(), 0, 0, bytes, true);
+        }
+    }
 
     void write_otd_expert_slots(cldnn::stream& stream,
                                 typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
                                 scratch_buffers& scratch,
                                 const std::vector<size_t>& lease) {
-        auto* perf = moe_otd::get_perf_counters();
-        ScopedOtdTimer index_write_timer(perf ? &perf->index_write_ns : nullptr);
-        const size_t topk_bytes = lease.size() * sizeof(uint32_t);
-        if (!_otd_expert_index_buffer || _otd_expert_index_buffer->size() < topk_bytes) {
-            auto& engine = instance.get_network().get_engine();
-            auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(topk_bytes)}, ov::element::i8, cldnn::format::bfyx);
-            _otd_expert_index_buffer = engine.allocate_memory(layout, allocation_type::usm_host, false);
-        }
-        // Callers drain the in-order queue first (finish or blocking topk readback), so no kernel still reads this buffer.
-        const bool host_writable = _otd_expert_index_buffer->get_allocation_type() == allocation_type::usm_host &&
-                                   stream.get_queue_type() == ov::intel_gpu::QueueTypes::in_order;
-        auto* host_slots = host_writable ? static_cast<uint32_t*>(_otd_expert_index_buffer->buffer_ptr()) : nullptr;
-        if (host_slots) {
-            for (size_t i = 0; i < lease.size(); i++) {
-                host_slots[i] = static_cast<uint32_t>(lease[i]);
-            }
-        } else {
-            std::vector<uint32_t> slots_u32(lease.size());
-            for (size_t i = 0; i < lease.size(); i++) {
-                slots_u32[i] = static_cast<uint32_t>(lease[i]);
-            }
-            _otd_expert_index_buffer->copy_from(stream, slots_u32.data(), 0, 0, topk_bytes, true);
-        }
+        write_otd_index(stream, instance, _otd_expert_index_buffer, std::vector<int32_t>(lease.begin(), lease.end()));
         scratch._expert_index_buffer = _otd_expert_index_buffer;
+    }
+
+    // MOE_OTD_SPLIT index for one batched GEMV pass: the slots whose ready flag equals `ready` (or all slots
+    // when `ready` is negative), -1 elsewhere, then one shared-expert flag per token.
+    static std::vector<int32_t> make_split_index(const ExpertRequest& req, size_t token_num, int ready, int32_t shared_flag) {
+        std::vector<int32_t> values(req.slots.size() + token_num, shared_flag);
+        for (size_t i = 0; i < req.slots.size(); ++i) {
+            values[i] = (ready < 0 || req.ready[i] == ready) ? static_cast<int32_t>(req.slots[i]) : -1;
+        }
+        return values;
     }
 
     void set_otd_weight_pointers(typed_primitive_inst<moe_3gemm_fused_compressed>& instance, scratch_buffers& scratch) {
@@ -793,11 +809,14 @@ public:
         }
     }
 
+    // On success with OTD, otd_request holds the pinned slots; the first-pass index (ready experts plus the
+    // shared expert, or everything when no load is pending) is in scratch._expert_index_buffer.
     void on_before_batched_gemv(cldnn::stream& stream,
                                 typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
                                 scratch_buffers& scratch,
                                 size_t topk_count,
-                                bool& needs_fallback) {
+                                bool& needs_fallback,
+                                std::optional<ExpertRequest>& otd_request) {
         if (!_weight_provider->is_offloaded()) {
             needs_fallback = false;
             return;
@@ -817,17 +836,26 @@ public:
             scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
         }
 
-        auto lease = _weight_provider->try_acquire_simultaneous(expert_ids, stream);
-        if (!lease) {
-            if (auto* perf = moe_otd::get_perf_counters()) {
+        auto req = _weight_provider->request(expert_ids, stream);
+        if (!req) {
+            if (perf) {
                 perf->batched_fallbacks.fetch_add(1, std::memory_order_relaxed);
             }
             needs_fallback = true;
             return;
         }
 
-        moe_otd::record_route_trace(instance.id(), topk_count / top_k, top_k, expert_ids);
-        write_otd_expert_slots(stream, instance, scratch, *lease);
+        otd_request = std::move(req);
+        auto& r = *otd_request;
+
+        const size_t token_num = topk_count / top_k;
+        moe_otd::record_route_trace(instance.id(), token_num, top_k, expert_ids);
+        // Without a shared expert or a ready routed expert the first pass would be empty.
+        if (!r.all_ready() && !_has_shared_expert && std::find(r.ready.begin(), r.ready.end(), 1) == r.ready.end()) {
+            _weight_provider->wait(r);
+        }
+        write_otd_index(stream, instance, _otd_expert_index_buffer, make_split_index(r, token_num, r.all_ready() ? -1 : 1, 1));
+        scratch._expert_index_buffer = _otd_expert_index_buffer;
         set_otd_weight_pointers(instance, scratch);
         needs_fallback = false;
     }
@@ -1639,10 +1667,21 @@ public:
         const size_t subgroup_size = instance.get_impl_params()->get_device_info().arch >= gpu_arch::xe2 ? 32 : 16;
         const size_t max_work_group_size = instance.get_impl_params()->get_device_info().max_work_group_size;
 
+        std::optional<ExpertRequest> otd_request;
+        // Unpins the OTD slots once every kernel that reads them has been enqueued.
+        struct OtdRequestGuard {
+            IExpertWeightProvider& provider;
+            std::optional<ExpertRequest>& request;
+            ~OtdRequestGuard() {
+                if (request) {
+                    provider.release(*request);
+                }
+            }
+        } otd_guard{*_weight_provider, otd_request};
         {
             const size_t topk_count = token_num * static_cast<size_t>(max_topk);
             bool needs_fallback = false;
-            on_before_batched_gemv(stream, instance, scratch, topk_count, needs_fallback);
+            on_before_batched_gemv(stream, instance, scratch, topk_count, needs_fallback, otd_request);
             if (needs_fallback) {
                 // Cannot fit all experts simultaneously → fall back to per-expert onednn loop
                 instance.output_memory_ptr(0)->fill(stream, 0u);
@@ -1699,39 +1738,57 @@ public:
                                << std::endl;
 
         {
-            // scratch.up = up(x) * silu(gate(x)) for all (token, expert) pairs
-            std::vector<memory::ptr> args_gate_up =
-                {batch_mem_ptr, mlp_gate_wei_mem, mlp_gate_scale_mem, mlp_gate_zp_mem, mlp_up_wei_mem, mlp_up_scale_mem, mlp_up_zp_mem};
-            if (_has_shared_expert) {
-                args_gate_up.insert(args_gate_up.end(), extra_args_gate_up.begin(), extra_args_gate_up.end());
-            }
-            args_gate_up.push_back(hidden_states_mem_ptr);
+            // scratch.up = up(x) * silu(gate(x)), then scratch.y = down(scratch.up) * routing_weight for all (token, expert)
+            // pairs; with MOE_OTD_SPLIT, pairs whose index entry is -1 (or whose shared flag is 0) are skipped.
+            auto dispatch_experts = [&](const memory::ptr& index_mem, const std::vector<cldnn::event::ptr>& deps) {
+                std::vector<memory::ptr> args_gate_up =
+                    {index_mem, mlp_gate_wei_mem, mlp_gate_scale_mem, mlp_gate_zp_mem, mlp_up_wei_mem, mlp_up_scale_mem, mlp_up_zp_mem};
+                if (_has_shared_expert) {
+                    args_gate_up.insert(args_gate_up.end(), extra_args_gate_up.begin(), extra_args_gate_up.end());
+                }
+                args_gate_up.push_back(hidden_states_mem_ptr);
 
-            auto ret_event = execute_stage(events,
-                                           instance,
-                                           *stage_gate_up,
-                                           args_gate_up,
-                                           {scratch.up},
-                                           {token_num * compute_experts, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
-                                           {1, subgroup_size, SUBGROUP_NUM});
+                auto ev = execute_stage(deps,
+                                        instance,
+                                        *stage_gate_up,
+                                        args_gate_up,
+                                        {scratch.up},
+                                        {token_num * compute_experts, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
+                                        {1, subgroup_size, SUBGROUP_NUM});
 
-            // scratch.y = down(scratch.up) * routing_weight for all (token, expert) pairs
-            std::vector<memory::ptr> args_down = {batch_mem_ptr, mlp_down_wei_mem, mlp_down_scale_mem, mlp_down_zp_mem};
-            if (_has_shared_expert) {
-                args_down.insert(args_down.end(), extra_args_down.begin(), extra_args_down.end());
+                std::vector<memory::ptr> args_down = {index_mem, mlp_down_wei_mem, mlp_down_scale_mem, mlp_down_zp_mem};
+                if (_has_shared_expert) {
+                    args_down.insert(args_down.end(), extra_args_down.begin(), extra_args_down.end());
+                }
+                args_down.push_back(scratch.up);
+                args_down.push_back(routing_mem_ptr);  // compact topk_weights [token_num * MAX_TOPK]
+                if (_has_shared_expert) {
+                    args_down.push_back(scratch.routing_weights);  // shared_gate_in [token_num]
+                }
+                return execute_stage({ev},
+                                     instance,
+                                     *stage_down,
+                                     args_down,
+                                     {scratch.y},
+                                     {token_num * compute_experts, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
+                                     {1, subgroup_size, SUBGROUP_NUM});
+            };
+
+            auto ret_event = dispatch_experts(batch_mem_ptr, events);
+            if (otd_request && !otd_request->all_ready()) {
+                // Let the GPU run the ready experts while the remaining ones load.
+                stream.flush();
+                auto* perf = moe_otd::get_perf_counters();
+                {
+                    ScopedOtdTimer split_wait_timer(perf ? &perf->split_wait_ns : nullptr);
+                    _weight_provider->wait(*otd_request);
+                }
+                if (perf) {
+                    perf->batched_split_passes.fetch_add(1, std::memory_order_relaxed);
+                }
+                write_otd_index(stream, instance, _otd_expert_index_buffer_pass2, make_split_index(*otd_request, token_num, 0, 0));
+                ret_event = dispatch_experts(_otd_expert_index_buffer_pass2, {ret_event});
             }
-            args_down.push_back(scratch.up);
-            args_down.push_back(routing_mem_ptr);  // compact topk_weights [token_num * MAX_TOPK]
-            if (_has_shared_expert) {
-                args_down.push_back(scratch.routing_weights);  // shared_gate_in [token_num]
-            }
-            ret_event = execute_stage({ret_event},
-                                      instance,
-                                      *stage_down,
-                                      args_down,
-                                      {scratch.y},
-                                      {token_num * compute_experts, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
-                                      {1, subgroup_size, SUBGROUP_NUM});
 
             // Per-token reduction: final[t] = sum(scratch.y[t * REDUCE_COUNT .. (t+1) * REDUCE_COUNT - 1])
             // The local size must divide hidden_size: drivers may reject non-uniform work-groups (-54).

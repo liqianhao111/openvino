@@ -41,10 +41,14 @@ private:
     std::vector<uint8_t> _staging;
 };
 
+enum class IoPriority : size_t { urgent = 0, prefetch = 1 };
+
 // Fixed-size thread pool that executes batches of independent file-read tasks for MoE OTD.
 class MoeIoEngine {
 public:
     using Task = std::function<void(IoWorkerContext&)>;
+    struct Batch;
+    using Ticket = std::shared_ptr<Batch>;
 
     explicit MoeIoEngine(size_t num_threads);
     ~MoeIoEngine();
@@ -64,18 +68,25 @@ public:
         return _workers.size();
     }
 
-    // Executes all tasks on the pool (the calling thread participates) and blocks until every task
-    // has finished. Rethrows the first task exception; unstarted tasks of a failed batch are skipped.
-    void run(std::vector<Task> tasks);
+    // Queues tasks and returns immediately. Workers drain all urgent batches before prefetch batches.
+    Ticket submit(std::vector<Task> tasks, IoPriority priority = IoPriority::urgent);
+
+    // Runs the batch's unstarted tasks on the calling thread, then blocks until every task has finished.
+    // Rethrows the first task exception; unstarted tasks of a failed batch are skipped.
+    void wait(const Ticket& ticket);
+
+    static bool is_done(const Ticket& ticket);
+
+    void run(std::vector<Task> tasks) {
+        wait(submit(std::move(tasks)));
+    }
 
 private:
-    struct Batch;
-
     void worker_loop();
     static void execute(Batch& batch, size_t index, IoWorkerContext& context);
 
     std::vector<std::thread> _workers;
-    std::deque<std::shared_ptr<Batch>> _queue;
+    std::deque<Ticket> _queues[2];
     // File handles for threads calling run(), reused across calls and closed with the engine.
     std::vector<std::unique_ptr<IoWorkerContext>> _caller_contexts;
     std::mutex _mutex;

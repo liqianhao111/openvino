@@ -58,26 +58,7 @@ using namespace ov::intel_gpu::ocl;
 // the definitions moved to impls/onednn/grouped_matmul_helper.hpp.
 using cldnn::onednn::onednn_linear;
 using cldnn::onednn::onednn_matmul;
-
-class ScopedOtdTimer {
-public:
-    explicit ScopedOtdTimer(std::atomic<uint64_t>* counter) : _counter(counter), _start(std::chrono::steady_clock::now()) {}
-
-    ~ScopedOtdTimer() {
-        if (_counter) {
-            const auto elapsed = std::chrono::steady_clock::now() - _start;
-            _counter->fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
-                                std::memory_order_relaxed);
-        }
-    }
-
-    ScopedOtdTimer(const ScopedOtdTimer&) = delete;
-    ScopedOtdTimer& operator=(const ScopedOtdTimer&) = delete;
-
-private:
-    std::atomic<uint64_t>* _counter;
-    std::chrono::steady_clock::time_point _start;
-};
+using moe_otd::ScopedOtdTimer;
 
 dnnl::memory::data_type convert_data_type(cldnn::data_types dt) {
     switch (dt) {

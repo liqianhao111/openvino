@@ -2,18 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "test_utils/test_utils.h"
 #include "ocl_v2/moe/expert_weight_providers.hpp"
+#include "ocl_v2/moe/moe_otd_io.hpp"
 
 using namespace cldnn;
 using namespace tests;
 using ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider;
 using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
+using ov::intel_gpu::ocl::moe_otd::IoWorkerContext;
 using ov::intel_gpu::ocl::moe_otd::maybe_transpose_scale_zp;
+using ov::intel_gpu::ocl::moe_otd::MoeIoEngine;
 
 namespace {
 
@@ -58,7 +68,184 @@ std::vector<uint8_t> reference_u4_transpose(const std::vector<uint8_t>& src, siz
     return dst;
 }
 
+class TempWeightsFile {
+public:
+    explicit TempWeightsFile(const std::vector<uint8_t>& bytes) {
+        _path = std::filesystem::temp_directory_path() /
+                ("moe_otd_io_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+        std::ofstream out(_path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    ~TempWeightsFile() {
+        std::error_code ec;
+        std::filesystem::remove(_path, ec);
+    }
+    const std::filesystem::path& path() const {
+        return _path;
+    }
+
+private:
+    std::filesystem::path _path;
+};
+
 }  // namespace
+
+TEST(moe_otd_io_engine, runs_tasks_concurrently) {
+    MoeIoEngine engine(4);
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> running{0};
+    std::atomic<size_t> peak{0};
+    std::vector<MoeIoEngine::Task> tasks;
+    for (size_t i = 0; i < 32; ++i) {
+        tasks.emplace_back([&](IoWorkerContext&) {
+            const size_t now = ++running;
+            size_t prev = peak.load();
+            while (prev < now && !peak.compare_exchange_weak(prev, now)) {
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            --running;
+            ++completed;
+        });
+    }
+    engine.run(std::move(tasks));
+    EXPECT_EQ(completed.load(), 32U);
+    EXPECT_GE(peak.load(), 2U);
+}
+
+TEST(moe_otd_io_engine, propagates_task_exception_and_stays_usable) {
+    MoeIoEngine engine(2);
+    std::vector<MoeIoEngine::Task> failing;
+    for (size_t i = 0; i < 8; ++i) {
+        failing.emplace_back([i](IoWorkerContext&) {
+            if (i == 3) {
+                throw std::runtime_error("io failure");
+            }
+        });
+    }
+    EXPECT_THROW(engine.run(std::move(failing)), std::runtime_error);
+
+    std::atomic<size_t> completed{0};
+    std::vector<MoeIoEngine::Task> tasks(5, [&](IoWorkerContext&) {
+        ++completed;
+    });
+    engine.run(std::move(tasks));
+    EXPECT_EQ(completed.load(), 5U);
+}
+
+TEST(moe_otd_io_engine, worker_reads_match_file) {
+    const auto bytes = make_test_bytes(64 * 1024 + 123);
+    TempWeightsFile file(bytes);
+    std::vector<uint8_t> out(bytes.size());
+
+    MoeIoEngine engine(3);
+    constexpr size_t chunk = 4096;
+    std::vector<MoeIoEngine::Task> tasks;
+    for (size_t offset = 0; offset < bytes.size(); offset += chunk) {
+        const size_t size = std::min(chunk, bytes.size() - offset);
+        tasks.emplace_back([&, offset, size](IoWorkerContext& context) {
+            context.read(file.path(), reinterpret_cast<char*>(out.data() + offset), size, offset);
+        });
+    }
+    engine.run(std::move(tasks));
+    EXPECT_EQ(out, bytes);
+
+    std::vector<MoeIoEngine::Task> past_eof;
+    past_eof.emplace_back([&](IoWorkerContext& context) {
+        context.read(file.path(), reinterpret_cast<char*>(out.data()), 16, bytes.size());
+    });
+    EXPECT_ANY_THROW(engine.run(std::move(past_eof)));
+}
+
+TEST(moe_expert_weight_provider, offload_parallel_load_matches_reference) {
+    auto& engine = get_test_engine();
+    if (!engine.supports_allocation(allocation_type::usm_host)) {
+        GTEST_SKIP() << "usm_host is not supported";
+    }
+
+    MOECompressed::Config config{};
+    config.num_expert = 4;
+    config.hidden_size = 1024;
+    config.inter_size = 512;
+    config.group_size = 64;
+    const size_t num_expert = config.num_expert;
+    const size_t gate_up_groups = config.hidden_size / config.group_size;
+    const size_t down_groups = config.inter_size / config.group_size;
+
+    // Offset order: gate_w, up_w, down_w, gate_s, up_s, down_s, gate_z, up_z, down_z.
+    const std::vector<layout> layouts = {
+        layout(ov::PartialShape{4, 512, 1024}, data_types::u4, format::bfyx),
+        layout(ov::PartialShape{4, 512, 1024}, data_types::u4, format::bfyx),
+        layout(ov::PartialShape{4, 1024, 512}, data_types::u4, format::bfyx),
+        layout(ov::PartialShape{4, 512, static_cast<int64_t>(gate_up_groups)}, data_types::f16, format::bfyx),
+        layout(ov::PartialShape{4, 512, static_cast<int64_t>(gate_up_groups)}, data_types::f16, format::bfyx),
+        layout(ov::PartialShape{4, 1024, static_cast<int64_t>(down_groups)}, data_types::f16, format::bfyx),
+        layout(ov::PartialShape{4, 512, static_cast<int64_t>(gate_up_groups)}, data_types::u4, format::bfyx),
+        layout(ov::PartialShape{4, 512, static_cast<int64_t>(gate_up_groups)}, data_types::u4, format::bfyx),
+        layout(ov::PartialShape{4, 1024, static_cast<int64_t>(down_groups)}, data_types::u4, format::bfyx),
+    };
+
+    std::vector<size_t> offsets;
+    std::vector<uint8_t> file_bytes;
+    for (const auto& l : layouts) {
+        offsets.push_back(file_bytes.size());
+        const auto region = make_test_bytes(l.bytes_count());
+        file_bytes.insert(file_bytes.end(), region.begin(), region.end());
+        file_bytes.push_back(0x5A);  // keep regions unaligned to each other
+    }
+    TempWeightsFile file(file_bytes);
+
+    std::vector<memory::ptr> mems;
+    for (const auto& l : layouts) {
+        mems.push_back(engine.allocate_memory(l, allocation_type::usm_host, false));
+    }
+    moe_weights resident;
+    resident.gate_w = mems[0];
+    resident.up_w = mems[1];
+    resident.down_w = mems[2];
+    resident.gate_s = mems[3];
+    resident.up_s = mems[4];
+    resident.down_s = mems[5];
+    resident.gate_z = mems[6];
+    resident.up_z = mems[7];
+    resident.down_z = mems[8];
+
+    OffloadExpertWeightProvider provider(/*capacity=*/num_expert, config, offsets, file.path());
+    provider.bind(resident);
+
+    auto expect_slot_holds_expert = [&](size_t slot, uint32_t expert) {
+        for (size_t pos = 0; pos < layouts.size(); ++pos) {
+            const size_t per_expert = layouts[pos].bytes_count() / num_expert;
+            const auto src_begin = file_bytes.begin() + static_cast<std::ptrdiff_t>(offsets[pos] + expert * per_expert);
+            std::vector<uint8_t> expected(src_begin, src_begin + static_cast<std::ptrdiff_t>(per_expert));
+            if (pos >= 3) {
+                const bool is_down = pos % 3 == 2;
+                const size_t oc = is_down ? config.hidden_size : config.inter_size;
+                const size_t groups = is_down ? down_groups : gate_up_groups;
+                expected = pos < 6 ? reference_byte_transpose(expected, oc, groups, 2) : reference_u4_transpose(expected, oc, groups);
+            }
+            mem_lock<uint8_t, mem_lock_type::read> lock(mems[pos], get_test_stream());
+            std::vector<uint8_t> actual(lock.data() + slot * per_expert, lock.data() + (slot + 1) * per_expert);
+            EXPECT_EQ(actual, expected) << "tensor=" << pos << ", slot=" << slot << ", expert=" << expert;
+        }
+    };
+
+    const std::vector<uint32_t> experts = {3, 1, 3, 2};
+    auto lease = provider.try_acquire_simultaneous(experts, get_test_stream());
+    ASSERT_TRUE(lease.has_value());
+    ASSERT_EQ((*lease)[0], (*lease)[2]);
+    for (size_t i = 0; i < experts.size(); ++i) {
+        expect_slot_holds_expert((*lease)[i], experts[i]);
+    }
+
+    const size_t slot0 = provider.acquire_one(0, get_test_stream());
+    expect_slot_holds_expert(slot0, 0);
+
+    // All four experts are now resident; a repeat request must hit without reloading.
+    auto repeat = provider.try_acquire_simultaneous({0, 1, 2, 3}, get_test_stream());
+    ASSERT_TRUE(repeat.has_value());
+    EXPECT_EQ((*repeat)[1], (*lease)[1]);
+    EXPECT_EQ((*repeat)[0], slot0);
+}
 
 TEST(moe_otd_transpose, scale_f16_and_f32_match_reference) {
     const auto config = make_transpose_test_config();

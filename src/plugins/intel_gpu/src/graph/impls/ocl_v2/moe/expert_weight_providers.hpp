@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -90,12 +91,18 @@ public:
     }
 
 private:
+    // Loads all (expert, slot) misses at once: in parallel on the IO engine for host-USM slots,
+    // otherwise serially through the GPU queue.
+    void load_experts(const std::vector<uint32_t>& experts, const std::vector<size_t>& slots, cldnn::stream& stream);
+
     size_t _capacity = 0;
     cldnn::MOECompressed::Config _config{};
     std::vector<size_t> _weight_bin_offsets;
     std::filesystem::path _weights_path;
     std::shared_ptr<LRUCache> _cache;
     moe_otd::ParallelWeightReader _weight_reader;
+    std::shared_ptr<moe_otd::MoeIoEngine> _io_engine;
+    std::once_flag _io_engine_once;
     cldnn::moe_weights* _resident = nullptr;
     bool _bound = false;
 };

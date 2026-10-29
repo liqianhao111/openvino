@@ -706,11 +706,21 @@ public:
             auto layout = cldnn::layout({1, 1, 1, static_cast<ov::Dimension::value_type>(topk_bytes)}, ov::element::i8, cldnn::format::bfyx);
             _otd_expert_index_buffer = engine.allocate_memory(layout, allocation_type::usm_host, false);
         }
-        std::vector<uint32_t> slots_u32(lease.size());
-        for (size_t i = 0; i < lease.size(); i++) {
-            slots_u32[i] = static_cast<uint32_t>(lease[i]);
+        // Callers drain the in-order queue first (finish or blocking topk readback), so no kernel still reads this buffer.
+        const bool host_writable = _otd_expert_index_buffer->get_allocation_type() == allocation_type::usm_host &&
+                                   stream.get_queue_type() == ov::intel_gpu::QueueTypes::in_order;
+        auto* host_slots = host_writable ? static_cast<uint32_t*>(_otd_expert_index_buffer->buffer_ptr()) : nullptr;
+        if (host_slots) {
+            for (size_t i = 0; i < lease.size(); i++) {
+                host_slots[i] = static_cast<uint32_t>(lease[i]);
+            }
+        } else {
+            std::vector<uint32_t> slots_u32(lease.size());
+            for (size_t i = 0; i < lease.size(); i++) {
+                slots_u32[i] = static_cast<uint32_t>(lease[i]);
+            }
+            _otd_expert_index_buffer->copy_from(stream, slots_u32.data(), 0, 0, topk_bytes, true);
         }
-        _otd_expert_index_buffer->copy_from(stream, slots_u32.data(), 0, 0, topk_bytes, true);
         scratch._expert_index_buffer = _otd_expert_index_buffer;
     }
 

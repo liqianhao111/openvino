@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -14,6 +15,7 @@
 #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
 #include "intel_gpu/runtime/stream.hpp"
 #include "lru_cache.hpp"
+#include "moe_otd_io.hpp"
 #include "openvino/util/parallel_io.hpp"
 
 namespace ov::intel_gpu::ocl::moe_otd {
@@ -25,9 +27,13 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> moe_executions{0};
     std::atomic<uint64_t> gpu_hits{0};
     std::atomic<uint64_t> gpu_misses{0};
+    // disk_io_ns / transpose_ns are summed over IO worker threads, not wall time.
     std::atomic<uint64_t> disk_io_ns{0};
     std::atomic<uint64_t> transpose_ns{0};
     std::atomic<uint64_t> gpu_copy_ns{0};
+    std::atomic<uint64_t> io_batches{0};
+    std::atomic<uint64_t> io_tasks{0};
+    std::atomic<uint64_t> io_wait_ns{0};
     std::atomic<uint64_t> finish_wait_ns{0};
     std::atomic<uint64_t> topk_readback_ns{0};
     std::atomic<uint64_t> index_write_ns{0};
@@ -43,6 +49,30 @@ struct OtdPerfCounters {
 };
 
 OtdPerfCounters* get_perf_counters();
+
+class ScopedOtdTimer {
+public:
+    explicit ScopedOtdTimer(std::atomic<uint64_t>* counter) : _counter(counter) {
+        if (_counter) {
+            _start = std::chrono::steady_clock::now();
+        }
+    }
+
+    ~ScopedOtdTimer() {
+        if (_counter) {
+            const auto elapsed = std::chrono::steady_clock::now() - _start;
+            _counter->fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                                std::memory_order_relaxed);
+        }
+    }
+
+    ScopedOtdTimer(const ScopedOtdTimer&) = delete;
+    ScopedOtdTimer& operator=(const ScopedOtdTimer&) = delete;
+
+private:
+    std::atomic<uint64_t>* _counter;
+    std::chrono::steady_clock::time_point _start{};
+};
 
 // When MOE_OTD_TRACE is set, appends one text line per token: "step layer token e0,e1,...".
 // layer is assigned in first-execution order; step advances each time layer 0 runs again.
@@ -109,5 +139,38 @@ void fill_weights_memory(cldnn::stream& exec_stream,
                          cldnn::moe_weights& wei_mem,
                          const std::vector<uint32_t>& experts_list,
                          const std::vector<size_t>& lru_experts);
+
+// Raw (non-transposed) expert tensors are split into reads of at most this size so that a
+// single missing expert still spreads over several IO workers.
+inline constexpr size_t direct_read_chunk_bytes = 128 * 1024;
+
+// One IO task: reads an expert tensor (or a chunk of a raw weight tensor) straight into its
+// host-USM slot, transposing scale/zp through the worker staging buffer.
+struct HostTensorLoad {
+    size_t offset_pos = 0;
+    size_t file_offset = 0;
+    size_t size = 0;
+    uint8_t* dst = nullptr;
+    cldnn::data_types data_type = cldnn::data_types::dynamic;
+    bool counts_as_tensor = true;
+};
+
+// True when every non-empty routed slot tensor is host-USM, so loads can bypass the GPU queue
+// and run on IO worker threads.
+bool supports_direct_host_load(const cldnn::moe_weights& wei_mem);
+
+void plan_direct_host_loads(const cldnn::MOECompressed::Config& config,
+                            const std::vector<size_t>& weight_bin_offsets,
+                            size_t weight_file_size,
+                            const cldnn::moe_weights& wei_mem,
+                            uint32_t expert,
+                            size_t slot,
+                            size_t max_raw_chunk_bytes,
+                            std::vector<HostTensorLoad>& loads);
+
+void execute_direct_host_load(const cldnn::MOECompressed::Config& config,
+                              const HostTensorLoad& load,
+                              const std::filesystem::path& weights_path,
+                              IoWorkerContext& context);
 
 }  // namespace ov::intel_gpu::ocl::moe_otd

@@ -4,6 +4,7 @@
 
 #include "moe_otd_runtime.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -140,6 +141,105 @@ bool needs_scale_zp_transpose(size_t offset_pos) {
     return (offset_pos >= 3 && offset_pos <= 8);
 }
 
+constexpr size_t transpose_tile_size = 32;
+
+template <size_t ElementBytes>
+void transpose_fixed_width_tiled(const uint8_t* src, uint8_t* dst, size_t oc, size_t group_count) {
+    for (size_t o_block = 0; o_block < oc; o_block += transpose_tile_size) {
+        const size_t o_end = std::min(o_block + transpose_tile_size, oc);
+        for (size_t g_block = 0; g_block < group_count; g_block += transpose_tile_size) {
+            const size_t g_end = std::min(g_block + transpose_tile_size, group_count);
+            for (size_t o = o_block; o < o_end; ++o) {
+                for (size_t g = g_block; g < g_end; ++g) {
+                    const size_t src_offset = (o * group_count + g) * ElementBytes;
+                    const size_t dst_offset = (g * oc + o) * ElementBytes;
+                    if constexpr (ElementBytes == 1) {
+                        dst[dst_offset] = src[src_offset];
+                    } else {
+                        std::memcpy(dst + dst_offset, src + src_offset, ElementBytes);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void transpose_dynamic_width_tiled(const uint8_t* src,
+                                   uint8_t* dst,
+                                   size_t oc,
+                                   size_t group_count,
+                                   size_t element_bytes) {
+    for (size_t o_block = 0; o_block < oc; o_block += transpose_tile_size) {
+        const size_t o_end = std::min(o_block + transpose_tile_size, oc);
+        for (size_t g_block = 0; g_block < group_count; g_block += transpose_tile_size) {
+            const size_t g_end = std::min(g_block + transpose_tile_size, group_count);
+            for (size_t o = o_block; o < o_end; ++o) {
+                for (size_t g = g_block; g < g_end; ++g) {
+                    const size_t src_offset = (o * group_count + g) * element_bytes;
+                    const size_t dst_offset = (g * oc + o) * element_bytes;
+                    std::memcpy(dst + dst_offset, src + src_offset, element_bytes);
+                }
+            }
+        }
+    }
+}
+
+void transpose_by_element_width(const uint8_t* src,
+                                uint8_t* dst,
+                                size_t oc,
+                                size_t group_count,
+                                size_t element_bytes) {
+    switch (element_bytes) {
+    case 1:
+        transpose_fixed_width_tiled<1>(src, dst, oc, group_count);
+        break;
+    case 2:
+        transpose_fixed_width_tiled<2>(src, dst, oc, group_count);
+        break;
+    case 4:
+        transpose_fixed_width_tiled<4>(src, dst, oc, group_count);
+        break;
+    default:
+        transpose_dynamic_width_tiled(src, dst, oc, group_count, element_bytes);
+        break;
+    }
+}
+
+uint8_t get_u4(const uint8_t* packed, size_t index) {
+    return static_cast<uint8_t>((packed[index / 2] >> ((index % 2) * 4)) & 0x0F);
+}
+
+void transpose_u4_zp_tiled(const uint8_t* src, uint8_t* dst, size_t oc, size_t group_count, size_t per_expert_size) {
+    if (oc % 2 != 0) {
+        std::memset(dst, 0, per_expert_size);
+        for (size_t g = 0; g < group_count; ++g) {
+            for (size_t o = 0; o < oc; ++o) {
+                const size_t src_idx = o * group_count + g;
+                const size_t dst_idx = g * oc + o;
+                dst[dst_idx / 2] |= static_cast<uint8_t>(get_u4(src, src_idx) << ((dst_idx % 2) * 4));
+            }
+        }
+        return;
+    }
+
+    for (size_t o_block = 0; o_block < oc; o_block += transpose_tile_size) {
+        const size_t o_end = std::min(o_block + transpose_tile_size, oc) & ~size_t{1};
+        for (size_t g_block = 0; g_block < group_count; g_block += transpose_tile_size) {
+            const size_t g_end = std::min(g_block + transpose_tile_size, group_count);
+            for (size_t g = g_block; g < g_end; ++g) {
+                for (size_t o = o_block; o < o_end; o += 2) {
+                    const size_t src_idx0 = o * group_count + g;
+                    const size_t src_idx1 = (o + 1) * group_count + g;
+                    const uint8_t lo = get_u4(src, src_idx0);
+                    const uint8_t hi = get_u4(src, src_idx1);
+                    const size_t dst_byte = (g * oc + o) / 2;
+                    dst[dst_byte] = static_cast<uint8_t>(lo | (hi << 4));
+                }
+            }
+        }
+    }
+}
+
 void transpose_scale_zp_to_buffer(const cldnn::MOECompressed::Config& config,
                                   size_t offset_pos,
                                   const cldnn::layout& layout,
@@ -186,18 +286,11 @@ void transpose_scale_zp_to_buffer(const cldnn::MOECompressed::Config& config,
                         ", got=",
                         per_expert_size);
 
-        for (size_t g = 0; g < group_count; g++) {
-            for (size_t o = 0; o < oc; o++) {
-                const size_t src_elem_idx = o * group_count + g;
-                const size_t dst_elem_idx = g * oc + o;
-                std::memcpy(dst + dst_elem_idx * elem_size, src + src_elem_idx * elem_size, elem_size);
-            }
-        }
+        transpose_by_element_width(src, dst, oc, group_count, elem_size);
         return;
     }
 
-    // ZP handling: u4 (packed 4-bit) requires unpack/transpose/repack;
-    // u8 (INT8) is 1 byte per element, transposed like scales.
+    // Byte-addressable ZP uses the same tiled transpose; packed u4 is handled below.
     const auto zp_et = ov::element::Type(layout.data_type);
     const size_t zp_bitwidth = zp_et.bitwidth();
     if (zp_bitwidth >= 8) {
@@ -211,13 +304,7 @@ void transpose_scale_zp_to_buffer(const cldnn::MOECompressed::Config& config,
                         ", got=",
                         per_expert_size);
 
-        for (size_t g = 0; g < group_count; g++) {
-            for (size_t o = 0; o < oc; o++) {
-                const size_t src_idx = o * group_count + g;
-                const size_t dst_idx = g * oc + o;
-                std::memcpy(dst + dst_idx * byte_per_elem, src + src_idx * byte_per_elem, byte_per_elem);
-            }
-        }
+        transpose_by_element_width(src, dst, oc, group_count, byte_per_elem);
         return;
     }
 
@@ -231,16 +318,7 @@ void transpose_scale_zp_to_buffer(const cldnn::MOECompressed::Config& config,
                     ", got=",
                     per_expert_size);
 
-    std::memset(dst, 0, per_expert_size);
-    for (size_t g = 0; g < group_count; g++) {
-        for (size_t o = 0; o < oc; o++) {
-            const size_t src_idx = o * group_count + g;
-            const size_t dst_idx = g * oc + o;
-            const uint8_t src_byte = src[src_idx / 2];
-            const uint8_t value = static_cast<uint8_t>((src_byte >> ((src_idx % 2) * 4)) & 0x0F);
-            dst[dst_idx / 2] |= static_cast<uint8_t>(value << ((dst_idx % 2) * 4));
-        }
-    }
+    transpose_u4_zp_tiled(src, dst, oc, group_count, per_expert_size);
 }
 
 }  // namespace
@@ -283,6 +361,7 @@ void fill_weights_memory(cldnn::stream& exec_stream,
     auto* perf = get_perf_counters();
 
     const size_t weight_file_size = weight_reader.file_size();
+    std::vector<uint8_t> payload;
 
     size_t index = 0;
     for (uint32_t expert : experts_list) {
@@ -331,11 +410,12 @@ void fill_weights_memory(cldnn::stream& exec_stream,
             }
 
             // Raw routed weights can be read straight into a host-USM slot. Scale/ZP
-            // tensors still need a staging source because their packed data is transposed.
-            std::vector<uint8_t> payload;
+            // tensors reuse this staging buffer because their packed data is transposed.
             uint8_t* read_buffer = host_dst;
             if (!direct_host_write || transpose) {
-                payload.resize(plan.per_expert_size);
+                if (payload.size() < plan.per_expert_size) {
+                    payload.resize(plan.per_expert_size);
+                }
                 read_buffer = payload.data();
             }
 

@@ -19,8 +19,10 @@
 
 using namespace cldnn;
 using namespace tests;
+using ov::intel_gpu::ocl::moe::ExpertSlotCache;
 using ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider;
 using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
+using ov::intel_gpu::ocl::moe::SlotState;
 using ov::intel_gpu::ocl::moe_otd::IoWorkerContext;
 using ov::intel_gpu::ocl::moe_otd::maybe_transpose_scale_zp;
 using ov::intel_gpu::ocl::moe_otd::MoeIoEngine;
@@ -88,6 +90,15 @@ private:
     std::filesystem::path _path;
 };
 
+size_t make_resident(ExpertSlotCache& cache, uint32_t expert) {
+    auto acquired = cache.acquire({expert});
+    OPENVINO_ASSERT(acquired.has_value());
+    const size_t slot = (*acquired)[0].slot;
+    cache.mark_ready(slot);
+    cache.unpin(slot);
+    return slot;
+}
+
 }  // namespace
 
 TEST(moe_otd_io_engine, runs_tasks_concurrently) {
@@ -154,6 +165,129 @@ TEST(moe_otd_io_engine, worker_reads_match_file) {
         context.read(file.path(), reinterpret_cast<char*>(out.data()), 16, bytes.size());
     });
     EXPECT_ANY_THROW(engine.run(std::move(past_eof)));
+}
+
+namespace {
+
+template <typename Pred>
+bool spin_until(Pred pred) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(moe_otd_io_engine, submit_returns_before_tasks_finish) {
+    MoeIoEngine engine(2);
+    std::atomic<bool> release{false};
+    std::atomic<size_t> completed{0};
+    std::vector<MoeIoEngine::Task> tasks(6, [&](IoWorkerContext&) {
+        ASSERT_TRUE(spin_until([&] {
+            return release.load();
+        }));
+        ++completed;
+    });
+    auto ticket = engine.submit(std::move(tasks));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    EXPECT_EQ(completed.load(), 0U);
+    EXPECT_FALSE(MoeIoEngine::is_done(ticket));
+
+    release = true;
+    engine.wait(ticket);
+    EXPECT_EQ(completed.load(), 6U);
+    EXPECT_TRUE(MoeIoEngine::is_done(ticket));
+
+    auto empty = engine.submit({});
+    EXPECT_TRUE(MoeIoEngine::is_done(empty));
+    engine.wait(empty);
+}
+
+TEST(moe_otd_io_engine, wait_executes_unstarted_tasks_on_caller) {
+    MoeIoEngine engine(1);
+    std::atomic<bool> blocker_started{false};
+    std::atomic<bool> release{false};
+    auto blocker = engine.submit({[&](IoWorkerContext&) {
+        blocker_started = true;
+        ASSERT_TRUE(spin_until([&] {
+            return release.load();
+        }));
+    }});
+    ASSERT_TRUE(spin_until([&] {
+        return blocker_started.load();
+    }));
+
+    // The only worker is busy, so wait() must run these on the calling thread.
+    const auto caller = std::this_thread::get_id();
+    std::atomic<size_t> on_caller{0};
+    std::vector<MoeIoEngine::Task> tasks(4, [&](IoWorkerContext&) {
+        if (std::this_thread::get_id() == caller) {
+            ++on_caller;
+        }
+    });
+    engine.wait(engine.submit(std::move(tasks)));
+    EXPECT_EQ(on_caller.load(), 4U);
+
+    release = true;
+    engine.wait(blocker);
+}
+
+TEST(moe_otd_io_engine, urgent_batches_run_before_prefetch) {
+    MoeIoEngine engine(1);
+    std::atomic<bool> blocker_started{false};
+    std::atomic<bool> release{false};
+    auto blocker = engine.submit({[&](IoWorkerContext&) {
+        blocker_started = true;
+        ASSERT_TRUE(spin_until([&] {
+            return release.load();
+        }));
+    }});
+    ASSERT_TRUE(spin_until([&] {
+        return blocker_started.load();
+    }));
+
+    std::mutex order_mutex;
+    std::vector<char> order;
+    std::atomic<size_t> completed{0};
+    auto make_tasks = [&](char tag) {
+        return std::vector<MoeIoEngine::Task>(3, [&, tag](IoWorkerContext&) {
+            {
+                std::lock_guard<std::mutex> lock(order_mutex);
+                order.push_back(tag);
+            }
+            ++completed;
+        });
+    };
+    auto prefetch = engine.submit(make_tasks('p'), ov::intel_gpu::ocl::moe_otd::IoPriority::prefetch);
+    auto urgent = engine.submit(make_tasks('u'), ov::intel_gpu::ocl::moe_otd::IoPriority::urgent);
+
+    release = true;
+    ASSERT_TRUE(spin_until([&] {
+        return completed.load() == 6;
+    }));
+    EXPECT_EQ(order, (std::vector<char>{'u', 'u', 'u', 'p', 'p', 'p'}));
+    engine.wait(blocker);
+    engine.wait(prefetch);
+    engine.wait(urgent);
+}
+
+TEST(moe_otd_io_engine, async_wait_rethrows_task_exception) {
+    MoeIoEngine engine(2);
+    std::vector<MoeIoEngine::Task> failing;
+    for (size_t i = 0; i < 6; ++i) {
+        failing.emplace_back([i](IoWorkerContext&) {
+            if (i == 2) {
+                throw std::runtime_error("io failure");
+            }
+        });
+    }
+    auto ticket = engine.submit(std::move(failing), ov::intel_gpu::ocl::moe_otd::IoPriority::prefetch);
+    EXPECT_THROW(engine.wait(ticket), std::runtime_error);
 }
 
 TEST(moe_expert_weight_provider, offload_parallel_load_matches_reference) {
@@ -245,6 +379,92 @@ TEST(moe_expert_weight_provider, offload_parallel_load_matches_reference) {
     ASSERT_TRUE(repeat.has_value());
     EXPECT_EQ((*repeat)[1], (*lease)[1]);
     EXPECT_EQ((*repeat)[0], slot0);
+
+    // Async request on a 2-slot provider over the same buffers: hits are ready at once, misses after wait().
+    OffloadExpertWeightProvider small(/*capacity=*/2, config, offsets, file.path());
+    small.bind(resident);
+    auto first = small.request({3}, get_test_stream());
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->ready, (std::vector<uint8_t>{0}));
+    EXPECT_FALSE(first->all_ready());
+    small.wait(*first);
+    EXPECT_TRUE(first->all_ready());
+    small.release(*first);
+    expect_slot_holds_expert(first->slots[0], 3);
+
+    auto mixed = small.request({0, 3, 0}, get_test_stream());
+    ASSERT_TRUE(mixed.has_value());
+    EXPECT_EQ(mixed->ready, (std::vector<uint8_t>{0, 1, 0}));
+    EXPECT_EQ(mixed->slots[1], first->slots[0]);
+    EXPECT_EQ(mixed->slots[0], mixed->slots[2]);
+    EXPECT_EQ(small.cache().pin_count(mixed->slots[0]), 1U);
+    EXPECT_EQ(small.cache().pin_count(mixed->slots[1]), 1U);
+    // Both slots are pinned, so a third expert cannot be placed.
+    EXPECT_FALSE(small.request({1}, get_test_stream()).has_value());
+    small.wait(*mixed);
+    EXPECT_EQ(small.cache().state(mixed->slots[0]), SlotState::ready);
+    small.release(*mixed);
+    EXPECT_EQ(small.cache().pin_count(mixed->slots[0]), 0U);
+    expect_slot_holds_expert(mixed->slots[0], 0);
+    expect_slot_holds_expert(mixed->slots[1], 3);
+}
+
+TEST(moe_expert_slot_cache, hits_are_pinned_before_eviction) {
+    ExpertSlotCache cache(2);
+    const size_t s0 = make_resident(cache, 10);
+    const size_t s1 = make_resident(cache, 11);
+    ASSERT_NE(s0, s1);
+
+    // 10 is least recently used, but it is requested together with the miss, so 11 is evicted.
+    auto acquired = cache.acquire({12, 10});
+    ASSERT_TRUE(acquired.has_value());
+    EXPECT_EQ((*acquired)[0].slot, s1);
+    EXPECT_EQ((*acquired)[0].state, SlotState::empty);
+    EXPECT_EQ((*acquired)[1].slot, s0);
+    EXPECT_EQ((*acquired)[1].state, SlotState::ready);
+    EXPECT_EQ(cache.state(s1), SlotState::loading);
+    EXPECT_FALSE(cache.find(11).has_value());
+}
+
+TEST(moe_expert_slot_cache, loading_and_pinned_slots_are_not_evicted) {
+    ExpertSlotCache cache(3);
+    const size_t ready = make_resident(cache, 1);
+    auto loading = cache.acquire({2});
+    ASSERT_TRUE(loading.has_value());
+    cache.unpin((*loading)[0].slot);  // unpinned but still LOADING
+    auto pinned = cache.acquire({3});
+    ASSERT_TRUE(pinned.has_value());
+    cache.mark_ready((*pinned)[0].slot);  // READY but pinned
+
+    // Only the slot of expert 1 is evictable: one miss fits, two do not and leave the cache unchanged.
+    EXPECT_FALSE(cache.acquire({4, 5}).has_value());
+    EXPECT_EQ(cache.find(1).value_or(SIZE_MAX), ready);
+    auto one = cache.acquire({4});
+    ASSERT_TRUE(one.has_value());
+    EXPECT_EQ((*one)[0].slot, ready);
+    EXPECT_FALSE(cache.find(1).has_value());
+}
+
+TEST(moe_expert_slot_cache, evicts_empty_then_least_recently_used) {
+    ExpertSlotCache cache(3);
+    const size_t a = make_resident(cache, 1);
+    const size_t b = make_resident(cache, 2);
+    const size_t c = make_resident(cache, 3);
+    EXPECT_EQ((std::vector<size_t>{a, b, c}), (std::vector<size_t>{0, 1, 2}));
+
+    make_resident(cache, 1);  // touch: LRU order is now 2, 3, 1
+    auto failed = cache.acquire({4});
+    ASSERT_TRUE(failed.has_value());
+    EXPECT_EQ((*failed)[0].slot, b);
+    cache.mark_failed(b);
+    cache.unpin(b);
+    EXPECT_FALSE(cache.find(4).has_value());
+    EXPECT_EQ(cache.state(b), SlotState::empty);
+
+    // The emptied slot is reused before evicting the LRU expert 3.
+    EXPECT_EQ(make_resident(cache, 5), b);
+    EXPECT_EQ(make_resident(cache, 6), c);
+    EXPECT_EQ(cache.size(), 3U);
 }
 
 TEST(moe_otd_transpose, scale_f16_and_f32_match_reference) {
@@ -317,7 +537,7 @@ TEST(moe_expert_weight_provider, offload_construction_state) {
     ASSERT_EQ(provider.resident_capacity(), 16U);
     // Resident buffers are bound lazily at first execute, not at construction.
     ASSERT_FALSE(provider.is_bound());
-    ASSERT_FALSE(provider.cache().is_initialized());
+    ASSERT_EQ(provider.cache().size(), 0U);
 }
 
 TEST(moe_expert_weight_provider, offload_bind_resident_buffers) {
@@ -328,7 +548,6 @@ TEST(moe_expert_weight_provider, offload_bind_resident_buffers) {
     cldnn::moe_weights resident;  // null device pointers are fine; only the binding flag matters here
     provider.bind(resident);
     ASSERT_TRUE(provider.is_bound());
-    ASSERT_TRUE(provider.cache().is_initialized());
 
     // Idempotent: a second bind keeps the provider bound.
     provider.bind(resident);
@@ -358,12 +577,9 @@ TEST(moe_expert_weight_provider, offload_try_acquire_simultaneous_capacity_overf
     cldnn::moe_weights resident{};
     provider.bind(resident);
 
-    // Pre-populate the LRU cache so experts 0,1 are hits (no disk I/O needed)
-    auto& cache = provider.cache();
-    cache.get_lru_item(0);
-    cache.set_filled(0);
-    cache.get_lru_item(1);
-    cache.set_filled(1);
+    // Pre-populate the cache so experts 0,1 are hits (no disk I/O needed)
+    make_resident(provider.cache(), 0);
+    make_resident(provider.cache(), 1);
 
     // 3 unique experts (0, 1, 2) exceeds capacity=2 -> nullopt
     std::vector<uint32_t> experts = {0, 1, 2, 0, 1};
@@ -395,11 +611,8 @@ TEST(moe_expert_weight_provider, offload_try_acquire_simultaneous_within_capacit
     provider.bind(resident);
 
     // Pre-populate cache
-    auto& cache = provider.cache();
-    cache.get_lru_item(0);
-    cache.set_filled(0);
-    cache.get_lru_item(1);
-    cache.set_filled(1);
+    make_resident(provider.cache(), 0);
+    make_resident(provider.cache(), 1);
 
     // 2 unique experts (0, 1) with duplicates -> within capacity=2
     std::vector<uint32_t> experts = {0, 1, 0, 1, 0};
@@ -422,9 +635,7 @@ TEST(moe_expert_weight_provider, offload_acquire_one_basic) {
     provider.bind(resident);
 
     // Pre-populate cache
-    auto& cache = provider.cache();
-    auto [slot0, hit0] = cache.get_lru_item(5);
-    cache.set_filled(slot0);
+    const size_t slot0 = make_resident(provider.cache(), 5);
 
     // acquire_one should return a valid slot
     auto slot = provider.acquire_one(5, get_test_stream());

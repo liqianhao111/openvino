@@ -12,9 +12,9 @@
 #include <string>
 #include <vector>
 
+#include "expert_slot_cache.hpp"
 #include "expert_weight_provider.hpp"
 #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
-#include "lru_cache.hpp"
 #include "moe_otd_runtime.hpp"
 
 namespace ov::intel_gpu::ocl::moe {
@@ -23,7 +23,6 @@ namespace ov::intel_gpu::ocl::moe {
 // for the network lifetime. This is the behaviour of the non-offloaded (ratio=0) path.
 class ResidentExpertWeightProvider : public IExpertWeightProvider {
 public:
-    void release() override {}
     size_t resident_capacity() const override {
         return 0;
     }
@@ -46,12 +45,13 @@ public:
         views.zp[2] = weights.down_z;
     }
 
-    std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& stream) override;
-    size_t acquire_one(uint32_t expert, cldnn::stream& stream) override;
+    std::optional<ExpertRequest> request(const std::vector<uint32_t>& experts, cldnn::stream& stream) override;
+    void wait(ExpertRequest& /*request*/) override {}
+    void release(ExpertRequest& /*request*/) override {}
 };
 
 // Offload (OTD) provider: expert weights live on disk and are streamed on demand
-// into a bounded set of device-resident slots managed by an LRU cache.
+// into a bounded set of device-resident slots managed by an ExpertSlotCache.
 // The provider deduplicates the requested experts, assigns/streams slots, and
 // returns the slot index per requested expert.
 //
@@ -73,16 +73,16 @@ public:
         return true;
     }
 
-    void release() override {}
     void bind(cldnn::moe_weights& resident) override;
     bool is_bound() const override {
         return _bound;
     }
     void fill_routed_weight_views(cldnn::moe_weights& weights, RoutedWeightViews& views) override;
-    std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& stream) override;
-    size_t acquire_one(uint32_t expert, cldnn::stream& stream) override;
+    std::optional<ExpertRequest> request(const std::vector<uint32_t>& experts, cldnn::stream& stream) override;
+    void wait(ExpertRequest& request) override;
+    void release(ExpertRequest& request) override;
 
-    LRUCache& cache() {
+    ExpertSlotCache& cache() {
         return *_cache;
     }
 
@@ -91,18 +91,21 @@ public:
     }
 
 private:
-    // Loads all (expert, slot) misses at once: in parallel on the IO engine for host-USM slots,
-    // otherwise serially through the GPU queue.
-    void load_experts(const std::vector<uint32_t>& experts, const std::vector<size_t>& slots, cldnn::stream& stream);
+    // Starts loading (expert, slot) misses. Host-USM slots load on the IO engine and return the
+    // in-flight handle; otherwise they load serially through the GPU queue and nullptr is returned.
+    std::shared_ptr<PendingExpertLoad> start_load(const std::vector<uint32_t>& experts, const std::vector<size_t>& slots, cldnn::stream& stream);
 
     size_t _capacity = 0;
     cldnn::MOECompressed::Config _config{};
     std::vector<size_t> _weight_bin_offsets;
     std::filesystem::path _weights_path;
-    std::shared_ptr<LRUCache> _cache;
+    std::shared_ptr<ExpertSlotCache> _cache;
     moe_otd::ParallelWeightReader _weight_reader;
     std::shared_ptr<moe_otd::MoeIoEngine> _io_engine;
     std::once_flag _io_engine_once;
+    // Serializes request(); _slot_pending[s] is the load that owns slot s while it is LOADING.
+    std::mutex _request_mutex;
+    std::vector<std::shared_ptr<PendingExpertLoad>> _slot_pending;
     cldnn::moe_weights* _resident = nullptr;
     bool _bound = false;
 };

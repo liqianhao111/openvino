@@ -110,18 +110,17 @@ std::shared_ptr<MoeIoEngine> MoeIoEngine::shared() {
     return engine;
 }
 
-void MoeIoEngine::run(std::vector<Task> tasks) {
-    if (tasks.empty()) {
-        return;
-    }
-
+MoeIoEngine::Ticket MoeIoEngine::submit(std::vector<Task> tasks, IoPriority priority) {
     auto batch = std::make_shared<Batch>();
     batch->tasks = std::move(tasks);
-    // The calling thread executes tasks too, so wake at most one worker per remaining task.
-    const size_t wake_count = std::min(batch->tasks.size() - 1, _workers.size());
+    if (batch->tasks.empty()) {
+        return batch;
+    }
+
+    const size_t wake_count = std::min(batch->tasks.size(), _workers.size());
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        _queue.push_back(batch);
+        _queues[static_cast<size_t>(priority)].push_back(batch);
     }
     if (wake_count == _workers.size()) {
         _cv.notify_all();
@@ -130,38 +129,50 @@ void MoeIoEngine::run(std::vector<Task> tasks) {
             _cv.notify_one();
         }
     }
+    return batch;
+}
+
+void MoeIoEngine::wait(const Ticket& ticket) {
+    OPENVINO_ASSERT(ticket != nullptr, "MoeIoEngine::wait called with an empty ticket");
+    Batch& batch = *ticket;
 
     std::unique_ptr<IoWorkerContext> context;
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (_caller_contexts.empty()) {
-            context = std::make_unique<IoWorkerContext>();
-        } else {
-            context = std::move(_caller_contexts.back());
-            _caller_contexts.pop_back();
-        }
-    }
     for (;;) {
         size_t index = 0;
         {
             std::lock_guard<std::mutex> lock(_mutex);
-            if (batch->next == batch->tasks.size()) {
+            if (batch.next == batch.tasks.size()) {
                 // Workers drop the exhausted batch from the queue when they reach it.
-                _caller_contexts.push_back(std::move(context));
+                if (context) {
+                    _caller_contexts.push_back(std::move(context));
+                }
                 break;
             }
-            index = batch->next++;
+            if (!context) {
+                if (_caller_contexts.empty()) {
+                    context = std::make_unique<IoWorkerContext>();
+                } else {
+                    context = std::move(_caller_contexts.back());
+                    _caller_contexts.pop_back();
+                }
+            }
+            index = batch.next++;
         }
-        execute(*batch, index, *context);
+        execute(batch, index, *context);
     }
 
-    std::unique_lock<std::mutex> lock(batch->mutex);
-    batch->done_cv.wait(lock, [&] {
-        return batch->done == batch->tasks.size();
+    std::unique_lock<std::mutex> lock(batch.mutex);
+    batch.done_cv.wait(lock, [&] {
+        return batch.done == batch.tasks.size();
     });
-    if (batch->error) {
-        std::rethrow_exception(batch->error);
+    if (batch.error) {
+        std::rethrow_exception(batch.error);
     }
+}
+
+bool MoeIoEngine::is_done(const Ticket& ticket) {
+    std::lock_guard<std::mutex> lock(ticket->mutex);
+    return ticket->done == ticket->tasks.size();
 }
 
 void MoeIoEngine::worker_loop() {
@@ -173,20 +184,21 @@ void MoeIoEngine::worker_loop() {
             std::unique_lock<std::mutex> lock(_mutex);
             for (;;) {
                 _cv.wait(lock, [this] {
-                    return _stop || !_queue.empty();
+                    return _stop || !_queues[0].empty() || !_queues[1].empty();
                 });
-                if (_queue.empty()) {
+                auto& queue = !_queues[0].empty() ? _queues[0] : _queues[1];
+                if (queue.empty()) {
                     return;
                 }
-                batch = _queue.front();
+                batch = queue.front();
                 if (batch->next < batch->tasks.size()) {
                     index = batch->next++;
                     if (batch->next == batch->tasks.size()) {
-                        _queue.pop_front();
+                        queue.pop_front();
                     }
                     break;
                 }
-                _queue.pop_front();
+                queue.pop_front();
             }
         }
         execute(*batch, index, context);

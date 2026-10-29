@@ -30,6 +30,8 @@ set(GPU_OCL_V2_IMPL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/group_normalization_ref.hpp
     ${CMAKE_CURRENT_LIST_DIR}/lora.cpp
     ${CMAKE_CURRENT_LIST_DIR}/lora.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/expert_slot_cache.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/expert_slot_cache.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/expert_weight_provider.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/expert_weight_providers.cpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/expert_weight_providers.hpp

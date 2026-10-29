@@ -42,6 +42,37 @@
 #endif
 
 #include "moe_gate_activation.cl"
+#if MOE_OTD_SPLIT
+// OTD index buffer: token_num * MAX_TOPK slots (-1 = computed in the other pass), then token_num shared-expert flags.
+// The whole work-group shares one (token, expert) pair, so returning early cannot strand a barrier.
+// A macro, not a function: gate_up and down are built into one program.
+#    define MOE_OTD_SKIP(expert_list, token_idx, expert_slot, is_shared)                                    \
+        ((is_shared) ? (expert_list[(int)(get_global_size(0) / EXPERTS_PER_TOKEN) * MAX_TOPK + (token_idx)] == 0) \
+                     : (expert_list[(token_idx) * MAX_TOPK + (expert_slot)] < 0))
+#endif
+
+// Gate activation: SwiGLU (Swish, default), GeGLU-Tanh, or GeGLU-ERF.
+// GATE_ACT_GELU_ERF takes precedence over GATE_ACT_GELU_TANH when both are set.
+#ifdef GATE_ACT_GELU_ERF
+// ERF Gelu: 0.5 * x * (1 + erf(x / sqrt(2))); A&S 7.1.26 fast erf approximation
+inline float moe_mlp_fast_erf(float x) {
+    const float p  = 0.3275911f;
+    const float a1 = 0.254829592f;
+    const float a2 = -0.284496736f;
+    const float a3 = 1.421413741f;
+    const float a4 = -1.453152027f;
+    const float a5 = 1.061405429f;
+    float z = fabs(x);
+    float t = 1.0f / (1.0f + p * z);
+    float y = 1.0f - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-(z * z));
+    return (x >= 0.0f) ? y : -y;
+}
+#    define MOE_GATE_ACT(x) (0.5f * (x) * (1.0f + moe_mlp_fast_erf((x) * 0.7071067811865475f)))
+#elif defined(GATE_ACT_GELU_TANH)
+#    define MOE_GATE_ACT(x) (0.5f * (x) * (1.0f + (tanh(0.79788458347320556640625f * (x) * (1.0f + 0.044715f * (x) * (x))))))
+#else
+#    define MOE_GATE_ACT(x) ((x) / (1.0f + exp(-(x))))
+#endif
 
 // HAS_ZP: 1 = asymmetric quantization (subtract zero point), 0 = symmetric (no zero point)
 #if HAS_ZP
@@ -454,6 +485,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_gate_up)(
     bool is_shared = (expert_slot == MAX_TOPK);
 #    else
     bool is_shared = false;
+#    endif
+
+#    if MOE_OTD_SPLIT
+    if (MOE_OTD_SKIP(expert_list, token_idx, expert_slot, is_shared)) {
+        return;
+    }
 #    endif
 
     const int gate_expert_wei_size = MOE_EXPERT_WEI_BYTES(GATE_WEIGHT_DT);
@@ -979,6 +1016,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) KERNEL(mlp_down)(const
     bool is_shared = (expert_slot == MAX_TOPK);
 #    else
     bool is_shared = false;
+#    endif
+
+#    if MOE_OTD_SPLIT
+    if (MOE_OTD_SKIP(expert_list, token_idx, expert_slot, is_shared)) {
+        return;
+    }
 #    endif
 
     const int expert_wei_size = MOE_EXPERT_WEI_BYTES(DOWN_WEIGHT_DT);

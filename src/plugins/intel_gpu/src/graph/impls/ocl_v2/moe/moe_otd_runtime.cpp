@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -37,6 +36,10 @@ void OtdPerfCounters::dump() const {
               << ", total_disk_io_ms=" << disk_io_ns.load(std::memory_order_relaxed) / 1000000
               << ", total_transpose_ms=" << transpose_ns.load(std::memory_order_relaxed) / 1000000
               << ", total_gpu_copy_ms=" << gpu_copy_ns.load(std::memory_order_relaxed) / 1000000
+              << ", io_threads=" << MoeIoEngine::configured_thread_count()
+              << ", io_batches=" << io_batches.load(std::memory_order_relaxed)
+              << ", io_tasks=" << io_tasks.load(std::memory_order_relaxed)
+              << ", io_wait_ms=" << io_wait_ns.load(std::memory_order_relaxed) / 1000000
               << ", batched_fallbacks=" << batched_fallbacks.load(std::memory_order_relaxed)
               << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
               << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed) << std::endl;
@@ -242,7 +245,7 @@ void transpose_u4_zp_tiled(const uint8_t* src, uint8_t* dst, size_t oc, size_t g
 
 void transpose_scale_zp_to_buffer(const cldnn::MOECompressed::Config& config,
                                   size_t offset_pos,
-                                  const cldnn::layout& layout,
+                                  cldnn::data_types data_type,
                                   const uint8_t* src,
                                   uint8_t* dst,
                                   size_t per_expert_size) {
@@ -276,7 +279,7 @@ void transpose_scale_zp_to_buffer(const cldnn::MOECompressed::Config& config,
 
     const size_t elem_count = oc * group_count;
     if (is_scale) {
-        const size_t elem_size = static_cast<size_t>(cldnn::data_type_traits::size_of(layout.data_type));
+        const size_t elem_size = static_cast<size_t>(cldnn::data_type_traits::size_of(data_type));
         OPENVINO_ASSERT(elem_size > 0, "Invalid scale element size for offset_pos=", offset_pos);
         OPENVINO_ASSERT(elem_count * elem_size == per_expert_size,
                         "Unexpected scale payload size for offset_pos=",
@@ -291,7 +294,7 @@ void transpose_scale_zp_to_buffer(const cldnn::MOECompressed::Config& config,
     }
 
     // Byte-addressable ZP uses the same tiled transpose; packed u4 is handled below.
-    const auto zp_et = ov::element::Type(layout.data_type);
+    const auto zp_et = ov::element::Type(data_type);
     const size_t zp_bitwidth = zp_et.bitwidth();
     if (zp_bitwidth >= 8) {
         // u8 or larger: transpose like scale (1+ bytes per element)
@@ -321,6 +324,89 @@ void transpose_scale_zp_to_buffer(const cldnn::MOECompressed::Config& config,
     transpose_u4_zp_tiled(src, dst, oc, group_count, per_expert_size);
 }
 
+constexpr size_t weight_tensor_count = cldnn::moe_3gemm_fused_compressed::serialized_weight_offset_count;
+
+constexpr std::array<const char*, weight_tensor_count> tensor_names = {
+    {"gate_w", "up_w", "down_w", "gate_s", "up_s", "down_s", "gate_z", "up_z", "down_z"}};
+
+// Ordered like the serialized weight offsets.
+std::array<cldnn::memory_ptr, weight_tensor_count> tensors_by_offset(const cldnn::moe_weights& wei_mem) {
+    return {{wei_mem.gate_w, wei_mem.up_w, wei_mem.down_w, wei_mem.gate_s, wei_mem.up_s, wei_mem.down_s, wei_mem.gate_z, wei_mem.up_z, wei_mem.down_z}};
+}
+
+struct tensor_fill_plan {
+    size_t per_expert_size = 0;
+    size_t src_offset = 0;
+    size_t dst_offset = 0;
+};
+
+tensor_fill_plan make_tensor_fill_plan(size_t num_expert,
+                                       size_t weight_file_size,
+                                       size_t base_offset,
+                                       const cldnn::memory_ptr& mem,
+                                       size_t expert_no,
+                                       size_t lru_expert_no,
+                                       const char* tensor_name) {
+    tensor_fill_plan plan;
+    if (!mem) {
+        return plan;
+    }
+    const auto total_bytes = mem->get_layout().bytes_count();
+    OPENVINO_ASSERT(num_expert > 0, "Invalid expert count");
+    plan.per_expert_size = total_bytes / num_expert;
+    plan.src_offset = base_offset + expert_no * plan.per_expert_size;
+    plan.dst_offset = lru_expert_no * plan.per_expert_size;
+    OPENVINO_ASSERT(plan.src_offset <= weight_file_size, "Invalid src_offset out of file: ", plan.src_offset, ", file_size=", weight_file_size);
+    OPENVINO_ASSERT(plan.per_expert_size <= weight_file_size - plan.src_offset,
+                    "Read range out of file for tensor ",
+                    tensor_name,
+                    ": src_offset=",
+                    plan.src_offset,
+                    ", per_expert_size=",
+                    plan.per_expert_size,
+                    ", file_size=",
+                    weight_file_size,
+                    ", base_offset=",
+                    base_offset,
+                    ", expert=",
+                    expert_no);
+    return plan;
+}
+
+// Reads one tensor (or raw-weight chunk) into host-visible slot memory; scale/zp go through staging and are transposed.
+template <typename ReadFn>
+void load_tensor_to_host(const cldnn::MOECompressed::Config& config,
+                         size_t offset_pos,
+                         cldnn::data_types data_type,
+                         uint8_t* dst,
+                         size_t size,
+                         size_t file_offset,
+                         ReadFn&& read,
+                         std::vector<uint8_t>& staging,
+                         OtdPerfCounters* perf,
+                         bool counts_as_tensor) {
+    const bool transpose = needs_scale_zp_transpose(offset_pos);
+    uint8_t* read_buffer = dst;
+    if (transpose) {
+        if (staging.size() < size) {
+            staging.resize(size);
+        }
+        read_buffer = staging.data();
+    }
+
+    {
+        ScopedOtdTimer timer(perf ? &perf->disk_io_ns : nullptr);
+        read(reinterpret_cast<char*>(read_buffer), size, file_offset);
+    }
+    if (transpose) {
+        ScopedOtdTimer timer(perf ? &perf->transpose_ns : nullptr);
+        transpose_scale_zp_to_buffer(config, offset_pos, data_type, staging.data(), dst, size);
+    }
+    if (perf && counts_as_tensor) {
+        perf->tensor_load_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 }  // namespace
 
 void maybe_transpose_scale_zp(const cldnn::MOECompressed::Config& config,
@@ -332,7 +418,7 @@ void maybe_transpose_scale_zp(const cldnn::MOECompressed::Config& config,
         return;
     }
     std::vector<uint8_t> transposed(per_expert_size, 0);
-    transpose_scale_zp_to_buffer(config, offset_pos, layout, payload.data(), transposed.data(), per_expert_size);
+    transpose_scale_zp_to_buffer(config, offset_pos, layout.data_type, payload.data(), transposed.data(), per_expert_size);
     payload.swap(transposed);
 }
 
@@ -343,133 +429,134 @@ void fill_weights_memory(cldnn::stream& exec_stream,
                          cldnn::moe_weights& wei_mem,
                          const std::vector<uint32_t>& experts_list,
                          const std::vector<size_t>& lru_experts) {
-    struct tensor_fill_plan {
-        size_t per_expert_size = 0;
-        size_t src_offset = 0;
-        size_t dst_offset = 0;
-    };
-
     const auto num_expert = static_cast<size_t>(config.num_expert);
 
-    OPENVINO_ASSERT(weight_bin_offsets.size() == cldnn::moe_3gemm_fused_compressed::serialized_weight_offset_count, "Unexpected number of MOE weight offsets");
+    OPENVINO_ASSERT(weight_bin_offsets.size() == weight_tensor_count, "Unexpected number of MOE weight offsets");
+    OPENVINO_ASSERT(experts_list.size() == lru_experts.size(), "Mismatched OTD expert and slot lists");
 
-    static const std::array<const char*, cldnn::moe_3gemm_fused_compressed::serialized_weight_offset_count> tensor_names = {
-        {"gate_w", "up_w", "down_w", "gate_s", "up_s", "down_s", "gate_z", "up_z", "down_z"}};
-    const std::array<cldnn::memory_ptr, cldnn::moe_3gemm_fused_compressed::serialized_weight_offset_count> tensors_by_offset = {
-        {wei_mem.gate_w, wei_mem.up_w, wei_mem.down_w, wei_mem.gate_s, wei_mem.up_s, wei_mem.down_s, wei_mem.gate_z, wei_mem.up_z, wei_mem.down_z}};
-
+    const auto tensors = tensors_by_offset(wei_mem);
     auto* perf = get_perf_counters();
 
     const size_t weight_file_size = weight_reader.file_size();
     std::vector<uint8_t> payload;
+    auto read_weights = [&](char* dst, size_t size, size_t file_offset) {
+        weight_reader.read(dst, size, file_offset);
+    };
 
-    size_t index = 0;
-    for (uint32_t expert : experts_list) {
-        auto make_tensor_fill_plan = [&](size_t base_offset, cldnn::memory_ptr mem, size_t expert_no, size_t lru_expert_no, const char* tensor_name) {
-            tensor_fill_plan plan;
-            if (!mem) {
-                return plan;
-            }
-            const auto total_bytes = mem->get_layout().bytes_count();
-            OPENVINO_ASSERT(num_expert > 0, "Invalid expert count");
-            plan.per_expert_size = total_bytes / num_expert;
-            plan.src_offset = base_offset + expert_no * plan.per_expert_size;
-            plan.dst_offset = lru_expert_no * plan.per_expert_size;
-            OPENVINO_ASSERT(plan.src_offset <= weight_file_size, "Invalid src_offset out of file: ", plan.src_offset, ", file_size=", weight_file_size);
-            OPENVINO_ASSERT(plan.per_expert_size <= weight_file_size - plan.src_offset,
-                            "Read range out of file for tensor ",
-                            tensor_name,
-                            ": src_offset=",
-                            plan.src_offset,
-                            ", per_expert_size=",
-                            plan.per_expert_size,
-                            ", file_size=",
-                            weight_file_size,
-                            ", base_offset=",
-                            base_offset,
-                            ", expert=",
-                            expert_no);
-            return plan;
-        };
-
-        for (size_t offset_pos = 0; offset_pos < static_cast<size_t>(cldnn::moe_3gemm_fused_compressed::serialized_weight_offset_count); offset_pos++) {
-            auto plan =
-                make_tensor_fill_plan(weight_bin_offsets[offset_pos], tensors_by_offset[offset_pos], expert, lru_experts[index], tensor_names[offset_pos]);
-            auto mem = tensors_by_offset[offset_pos];
+    for (size_t index = 0; index < experts_list.size(); index++) {
+        const uint32_t expert = experts_list[index];
+        for (size_t offset_pos = 0; offset_pos < weight_tensor_count; offset_pos++) {
+            const auto& mem = tensors[offset_pos];
+            auto plan = make_tensor_fill_plan(num_expert, weight_file_size, weight_bin_offsets[offset_pos], mem, expert, lru_experts[index], tensor_names[offset_pos]);
             if (!mem || plan.per_expert_size == 0) {
                 continue;
             }
 
-            const bool direct_host_write = mem->get_allocation_type() == cldnn::allocation_type::usm_host;
-            const bool transpose = needs_scale_zp_transpose(offset_pos);
-            uint8_t* host_dst = nullptr;
-            if (direct_host_write) {
-                host_dst = static_cast<uint8_t*>(mem->buffer_ptr());
+            if (mem->get_allocation_type() == cldnn::allocation_type::usm_host) {
+                auto* host_dst = static_cast<uint8_t*>(mem->buffer_ptr());
                 OPENVINO_ASSERT(host_dst != nullptr, "OTD usm_host slot has no host-accessible pointer for ", tensor_names[offset_pos]);
-                host_dst += plan.dst_offset;
-            }
-
-            // Raw routed weights can be read straight into a host-USM slot. Scale/ZP
-            // tensors reuse this staging buffer because their packed data is transposed.
-            uint8_t* read_buffer = host_dst;
-            if (!direct_host_write || transpose) {
-                if (payload.size() < plan.per_expert_size) {
-                    payload.resize(plan.per_expert_size);
-                }
-                read_buffer = payload.data();
-            }
-
-            auto read_weights = [&] {
-                weight_reader.read(reinterpret_cast<char*>(read_buffer), plan.per_expert_size, plan.src_offset);
-            };
-            if (perf) {
-                const auto t0 = std::chrono::steady_clock::now();
-                read_weights();
-                const auto t1 = std::chrono::steady_clock::now();
-                perf->disk_io_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
-                                           std::memory_order_relaxed);
-            } else {
-                read_weights();
-            }
-
-            if (direct_host_write) {
-                if (transpose) {
-                    if (perf) {
-                        const auto t0 = std::chrono::steady_clock::now();
-                        transpose_scale_zp_to_buffer(config, offset_pos, mem->get_layout(), payload.data(), host_dst, plan.per_expert_size);
-                        const auto t1 = std::chrono::steady_clock::now();
-                        perf->transpose_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
-                                                     std::memory_order_relaxed);
-                    } else {
-                        transpose_scale_zp_to_buffer(config, offset_pos, mem->get_layout(), payload.data(), host_dst, plan.per_expert_size);
-                    }
-                }
-                if (perf) {
-                    perf->tensor_load_count.fetch_add(1, std::memory_order_relaxed);
-                }
+                load_tensor_to_host(config,
+                                    offset_pos,
+                                    mem->get_layout().data_type,
+                                    host_dst + plan.dst_offset,
+                                    plan.per_expert_size,
+                                    plan.src_offset,
+                                    read_weights,
+                                    payload,
+                                    perf,
+                                    true);
                 continue;
             }
 
             // Device-USM fallback retains the existing staged transpose and blocking upload.
-            if (perf) {
-                const auto t0 = std::chrono::steady_clock::now();
+            if (payload.size() < plan.per_expert_size) {
+                payload.resize(plan.per_expert_size);
+            }
+            {
+                ScopedOtdTimer timer(perf ? &perf->disk_io_ns : nullptr);
+                read_weights(reinterpret_cast<char*>(payload.data()), plan.per_expert_size, plan.src_offset);
+            }
+            {
+                ScopedOtdTimer timer(perf ? &perf->transpose_ns : nullptr);
                 maybe_transpose_scale_zp(config, offset_pos, mem->get_layout(), payload, plan.per_expert_size);
-                const auto t1 = std::chrono::steady_clock::now();
-                mem->copy_from(exec_stream, payload.data(), 0, plan.dst_offset, plan.per_expert_size, true);
-                const auto t2 = std::chrono::steady_clock::now();
-                perf->transpose_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
-                                             std::memory_order_relaxed);
-                perf->gpu_copy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()),
-                                            std::memory_order_relaxed);
-                perf->tensor_load_count.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                maybe_transpose_scale_zp(config, offset_pos, mem->get_layout(), payload, plan.per_expert_size);
+            }
+            {
+                ScopedOtdTimer timer(perf ? &perf->gpu_copy_ns : nullptr);
                 mem->copy_from(exec_stream, payload.data(), 0, plan.dst_offset, plan.per_expert_size, true);
             }
+            if (perf) {
+                perf->tensor_load_count.fetch_add(1, std::memory_order_relaxed);
+            }
         }
-
-        index++;
     }
+}
+
+bool supports_direct_host_load(const cldnn::moe_weights& wei_mem) {
+    for (const auto& mem : tensors_by_offset(wei_mem)) {
+        if (!mem || mem->get_layout().bytes_count() == 0) {
+            continue;
+        }
+        if (mem->get_allocation_type() != cldnn::allocation_type::usm_host || mem->buffer_ptr() == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void plan_direct_host_loads(const cldnn::MOECompressed::Config& config,
+                            const std::vector<size_t>& weight_bin_offsets,
+                            size_t weight_file_size,
+                            const cldnn::moe_weights& wei_mem,
+                            uint32_t expert,
+                            size_t slot,
+                            size_t max_raw_chunk_bytes,
+                            std::vector<HostTensorLoad>& loads) {
+    OPENVINO_ASSERT(weight_bin_offsets.size() == weight_tensor_count, "Unexpected number of MOE weight offsets");
+    const auto num_expert = static_cast<size_t>(config.num_expert);
+    const auto tensors = tensors_by_offset(wei_mem);
+    for (size_t offset_pos = 0; offset_pos < weight_tensor_count; offset_pos++) {
+        const auto& mem = tensors[offset_pos];
+        const auto plan = make_tensor_fill_plan(num_expert, weight_file_size, weight_bin_offsets[offset_pos], mem, expert, slot, tensor_names[offset_pos]);
+        if (!mem || plan.per_expert_size == 0) {
+            continue;
+        }
+        auto* host_base = static_cast<uint8_t*>(mem->buffer_ptr());
+        OPENVINO_ASSERT(mem->get_allocation_type() == cldnn::allocation_type::usm_host && host_base != nullptr,
+                        "OTD direct load requires a host-USM slot for ",
+                        tensor_names[offset_pos]);
+
+        // Scale/zp are transposed as a whole, so only raw weights are split.
+        const size_t chunk = (needs_scale_zp_transpose(offset_pos) || max_raw_chunk_bytes == 0) ? plan.per_expert_size : max_raw_chunk_bytes;
+        for (size_t done = 0; done < plan.per_expert_size; done += chunk) {
+            HostTensorLoad load;
+            load.offset_pos = offset_pos;
+            load.file_offset = plan.src_offset + done;
+            load.size = std::min(chunk, plan.per_expert_size - done);
+            load.dst = host_base + plan.dst_offset + done;
+            load.data_type = mem->get_layout().data_type;
+            load.counts_as_tensor = done == 0;
+            loads.push_back(load);
+        }
+    }
+}
+
+void execute_direct_host_load(const cldnn::MOECompressed::Config& config,
+                              const HostTensorLoad& load,
+                              const std::filesystem::path& weights_path,
+                              IoWorkerContext& context) {
+    load_tensor_to_host(
+        config,
+        load.offset_pos,
+        load.data_type,
+        load.dst,
+        load.size,
+        load.file_offset,
+        [&](char* dst, size_t size, size_t file_offset) {
+            context.read(weights_path, dst, size, file_offset);
+        },
+        context.staging(),
+        get_perf_counters(),
+        load.counts_as_tensor);
 }
 
 }  // namespace ov::intel_gpu::ocl::moe_otd

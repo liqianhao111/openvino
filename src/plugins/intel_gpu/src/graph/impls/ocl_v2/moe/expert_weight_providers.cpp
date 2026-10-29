@@ -73,6 +73,8 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
     expert_to_slot.reserve(unique_experts.size());
 
     std::vector<size_t> slots(experts.size());
+    std::vector<uint32_t> missing_experts;
+    std::vector<size_t> missing_slots;
     auto* perf = moe_otd::get_perf_counters();
 
     for (size_t i = 0; i < experts.size(); i++) {
@@ -83,6 +85,7 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
             continue;
         }
 
+        // Unique experts <= capacity, so a later miss in this batch never evicts a slot assigned earlier.
         const auto item = _cache->get_lru_item(expert);
         const auto slot = item.first;
 
@@ -94,13 +97,19 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
             if (perf) {
                 perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
             }
-            OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
-            moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot});
-            _cache->set_filled(slot);
+            missing_experts.push_back(expert);
+            missing_slots.push_back(slot);
         }
 
         expert_to_slot.emplace(expert, slot);
         slots[i] = slot;
+    }
+
+    if (!missing_experts.empty()) {
+        load_experts(missing_experts, missing_slots, stream);
+        for (const size_t slot : missing_slots) {
+            _cache->set_filled(slot);
+        }
     }
 
     return slots;
@@ -120,12 +129,51 @@ size_t OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& 
         if (perf) {
             perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
         }
-        OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
-        moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot});
+        load_experts({expert}, {slot}, stream);
         _cache->set_filled(slot);
     }
 
     return slot;
+}
+
+void OffloadExpertWeightProvider::load_experts(const std::vector<uint32_t>& experts, const std::vector<size_t>& slots, cldnn::stream& stream) {
+    OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
+    std::call_once(_io_engine_once, [this] {
+        _io_engine = moe_otd::MoeIoEngine::shared();
+    });
+    if (!_io_engine || !moe_otd::supports_direct_host_load(*_resident)) {
+        moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, experts, slots);
+        return;
+    }
+
+    const size_t weight_file_size = _weight_reader.file_size();
+    std::vector<moe_otd::HostTensorLoad> loads;
+    for (size_t i = 0; i < experts.size(); i++) {
+        moe_otd::plan_direct_host_loads(_config,
+                                        _weight_bin_offsets,
+                                        weight_file_size,
+                                        *_resident,
+                                        experts[i],
+                                        slots[i],
+                                        moe_otd::direct_read_chunk_bytes,
+                                        loads);
+    }
+
+    std::vector<moe_otd::MoeIoEngine::Task> tasks;
+    tasks.reserve(loads.size());
+    for (const auto& load : loads) {
+        tasks.emplace_back([this, &load](moe_otd::IoWorkerContext& context) {
+            moe_otd::execute_direct_host_load(_config, load, _weights_path, context);
+        });
+    }
+
+    auto* perf = moe_otd::get_perf_counters();
+    if (perf) {
+        perf->io_batches.fetch_add(1, std::memory_order_relaxed);
+        perf->io_tasks.fetch_add(tasks.size(), std::memory_order_relaxed);
+    }
+    moe_otd::ScopedOtdTimer wait_timer(perf ? &perf->io_wait_ns : nullptr);
+    _io_engine->run(std::move(tasks));
 }
 
 }  // namespace ov::intel_gpu::ocl::moe

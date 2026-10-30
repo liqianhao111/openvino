@@ -51,6 +51,9 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> grouped_fallbacks{0};
     std::atomic<uint64_t> prefill_fallbacks{0};
     std::atomic<uint64_t> prefill_fallback_ns{0};
+    // Pipelined per-expert prefill: IO wait before computing an expert / waits for a computed expert to free its slot.
+    std::atomic<uint64_t> prefill_io_wait_ns{0};
+    std::atomic<uint64_t> prefill_slot_stalls{0};
     std::atomic<uint64_t> created_onednn_kernels{0};
 
     void dump() const;

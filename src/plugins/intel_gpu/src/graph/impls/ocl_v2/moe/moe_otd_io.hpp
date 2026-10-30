@@ -60,8 +60,8 @@ public:
     // Returns nullptr when GPU_MOE_OTD_IO_THREADS=0 (legacy serial loading).
     static std::shared_ptr<MoeIoEngine> shared();
 
-    // GPU_MOE_OTD_IO_THREADS if set, otherwise min(4, hardware_concurrency / 4).
-    // On PTL B390, 4 workers matched or beat 8 in both hot- and cold-cache runs.
+    // GPU_MOE_OTD_IO_THREADS if set, otherwise min(8, hardware_concurrency / 2).
+    // On PTL B390 with the pipelined prefill, 8 workers beat 4 (cold TTFT, TPOT) and 12/16 (TPOT).
     static size_t configured_thread_count();
 
     size_t num_threads() const {

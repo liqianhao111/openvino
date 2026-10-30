@@ -90,7 +90,7 @@ size_t MoeIoEngine::configured_thread_count() {
             return std::min<size_t>(static_cast<size_t>(value), max_threads);
         }
     }
-    return std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 4);
+    return std::clamp<size_t>(std::thread::hardware_concurrency() / 2, 1, 8);
 }
 
 std::shared_ptr<MoeIoEngine> MoeIoEngine::shared() {

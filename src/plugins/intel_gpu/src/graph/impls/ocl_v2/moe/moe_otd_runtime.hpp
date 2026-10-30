@@ -43,6 +43,11 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> batched_split_passes{0};
     // IO wait after the ready experts were dispatched in a split batched GEMV.
     std::atomic<uint64_t> split_wait_ns{0};
+    std::atomic<uint64_t> prefetch_issued{0};
+    // Demand hits on prefetched experts (loaded or still loading) / prefetched experts evicted unused.
+    std::atomic<uint64_t> prefetch_hits{0};
+    std::atomic<uint64_t> prefetch_wasted{0};
+    std::atomic<uint64_t> hint_readback_ns{0};
     std::atomic<uint64_t> grouped_fallbacks{0};
     std::atomic<uint64_t> prefill_fallbacks{0};
     std::atomic<uint64_t> prefill_fallback_ns{0};

@@ -94,7 +94,7 @@ size_t make_resident(ExpertSlotCache& cache, uint32_t expert) {
     auto acquired = cache.acquire({expert});
     OPENVINO_ASSERT(acquired.has_value());
     const size_t slot = (*acquired)[0].slot;
-    cache.mark_ready(slot);
+    cache.mark_ready(slot, (*acquired)[0].generation);
     cache.unpin(slot);
     return slot;
 }
@@ -434,7 +434,7 @@ TEST(moe_expert_slot_cache, loading_and_pinned_slots_are_not_evicted) {
     cache.unpin((*loading)[0].slot);  // unpinned but still LOADING
     auto pinned = cache.acquire({3});
     ASSERT_TRUE(pinned.has_value());
-    cache.mark_ready((*pinned)[0].slot);  // READY but pinned
+    cache.mark_ready((*pinned)[0].slot, (*pinned)[0].generation);  // READY but pinned
 
     // Only the slot of expert 1 is evictable: one miss fits, two do not and leave the cache unchanged.
     EXPECT_FALSE(cache.acquire({4, 5}).has_value());
@@ -456,7 +456,7 @@ TEST(moe_expert_slot_cache, evicts_empty_then_least_recently_used) {
     auto failed = cache.acquire({4});
     ASSERT_TRUE(failed.has_value());
     EXPECT_EQ((*failed)[0].slot, b);
-    cache.mark_failed(b);
+    cache.mark_failed(b, (*failed)[0].generation);
     cache.unpin(b);
     EXPECT_FALSE(cache.find(4).has_value());
     EXPECT_EQ(cache.state(b), SlotState::empty);
@@ -465,6 +465,42 @@ TEST(moe_expert_slot_cache, evicts_empty_then_least_recently_used) {
     EXPECT_EQ(make_resident(cache, 5), b);
     EXPECT_EQ(make_resident(cache, 6), c);
     EXPECT_EQ(cache.size(), 3U);
+}
+
+TEST(moe_expert_slot_cache, stale_generation_does_not_change_reassigned_slot) {
+    ExpertSlotCache cache(1);
+    auto first = cache.acquire({1}, /*prefetch=*/true);
+    ASSERT_TRUE(first.has_value());
+    const auto old = (*first)[0];
+    cache.mark_ready(old.slot, old.generation);
+    cache.unpin(old.slot);
+
+    auto second = cache.acquire({2});
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ((*second)[0].slot, old.slot);
+    EXPECT_TRUE((*second)[0].evicted_unused_prefetch);
+    // A late completion or failure of the old load must not touch the new assignment.
+    cache.mark_ready(old.slot, old.generation);
+    EXPECT_EQ(cache.state(old.slot), SlotState::loading);
+    cache.mark_failed(old.slot, old.generation);
+    EXPECT_EQ(cache.find(2).value_or(SIZE_MAX), old.slot);
+    cache.mark_ready(old.slot, (*second)[0].generation);
+    EXPECT_EQ(cache.state(old.slot), SlotState::ready);
+}
+
+TEST(moe_expert_slot_cache, prefetch_hit_is_reported_once) {
+    ExpertSlotCache cache(2);
+    auto prefetched = cache.acquire({7}, /*prefetch=*/true);
+    ASSERT_TRUE(prefetched.has_value());
+    cache.unpin((*prefetched)[0].slot);
+    auto first = cache.acquire({7});
+    ASSERT_TRUE(first.has_value());
+    EXPECT_TRUE((*first)[0].prefetch_hit);
+    EXPECT_EQ((*first)[0].state, SlotState::loading);
+    cache.unpin((*first)[0].slot);
+    auto again = cache.acquire({7});
+    ASSERT_TRUE(again.has_value());
+    EXPECT_FALSE((*again)[0].prefetch_hit);
 }
 
 TEST(moe_otd_transpose, scale_f16_and_f32_match_reference) {

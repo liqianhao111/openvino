@@ -81,6 +81,10 @@ public:
     // that may evict them is issued.
     virtual void release(ExpertRequest& request) = 0;
 
+    // Best effort, non-blocking: starts low-priority loads of experts a later request is likely to need.
+    // Must not be called while kernels that read this provider's slots may still be running.
+    virtual void prefetch(const std::vector<uint32_t>& /*experts*/, cldnn::stream& /*stream*/) {}
+
     // Blocking acquisition: request + wait + release. The lease is parallel to the input experts vector.
     std::optional<ExpertSlotLease> try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& stream) {
         auto req = request(experts, stream);

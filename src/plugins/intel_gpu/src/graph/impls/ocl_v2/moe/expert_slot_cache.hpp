@@ -26,17 +26,24 @@ public:
         size_t slot;
         // State before this call; EMPTY means the slot was just assigned and the caller must load it.
         SlotState state;
+        // Hit on a prefetched slot that no request had used yet.
+        bool prefetch_hit = false;
+        // The slot was taken from a prefetched expert that was never used.
+        bool evicted_unused_prefetch = false;
+        // Identifies this assignment of the slot; pass it to mark_ready/mark_failed.
+        uint64_t generation = 0;
     };
 
     // Pins one slot per expert (experts must be unique). Hits are pinned before any eviction.
-    // Newly assigned slots move to LOADING. Returns nullopt without changing anything when the
-    // evictable slots cannot hold all misses.
-    std::optional<std::vector<Acquired>> acquire(const std::vector<uint32_t>& experts);
+    // Newly assigned slots move to LOADING and are tagged as prefetched when `prefetch` is set.
+    // Returns nullopt without changing anything when the evictable slots cannot hold all misses.
+    std::optional<std::vector<Acquired>> acquire(const std::vector<uint32_t>& experts, bool prefetch = false);
 
     void unpin(size_t slot);
-    void mark_ready(size_t slot);
+    // Both are no-ops unless the slot is still LOADING for the assignment `generation`.
+    void mark_ready(size_t slot, uint64_t generation);
     // Drops the expert mapping of a LOADING slot whose load did not complete.
-    void mark_failed(size_t slot);
+    void mark_failed(size_t slot, uint64_t generation);
 
     size_t capacity() const {
         return _slots.size();
@@ -55,6 +62,8 @@ private:
         uint32_t expert = no_expert;
         uint32_t pins = 0;
         uint64_t last_use = 0;
+        uint64_t generation = 0;
+        bool unused_prefetch = false;
     };
 
     std::vector<Slot> _slots;

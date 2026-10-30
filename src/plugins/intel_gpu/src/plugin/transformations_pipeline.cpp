@@ -110,6 +110,7 @@
 #include "plugin/transformations/fuse_hadamard_fc.hpp"
 #include "plugin/transformations/fuse_moe_router.hpp"
 #include "plugin/transformations/fuse_moe_router_scale.hpp"
+#include "plugin/transformations/moe_lookahead_router.hpp"
 #include "plugin/transformations/fuse_rms_rope.hpp"
 #include "plugin/transformations/group_query_attention_decomposition.hpp"
 #include "plugin/transformations/increase_position_ids_precision.hpp"
@@ -1751,6 +1752,9 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         manager.register_pass<ov::pass::ConvertWeightCompressedConv1x1ToMatmul>();
         manager.register_pass<ov::intel_gpu::IncreaseRMSInputPrecision>();
         manager.register_pass<ov::intel_gpu::ClampFP16Output>();
+        if (config.get_offload_ratio() > 0 && config.get_offload_ratio() < 100) {
+            manager.register_pass<ov::intel_gpu::MoELookaheadRouter>(ov::intel_gpu::MoELookaheadRouter::configured_lookahead_k());
+        }
         manager.register_pass<ov::intel_gpu::ConvertMatMulToFullyConnected>(device_info.supports_immad);
         manager.register_pass<ov::pass::MoveFCReshapeToWeights<ov::intel_gpu::op::FullyConnected>>();
         if (!device_info.supports_immad) {

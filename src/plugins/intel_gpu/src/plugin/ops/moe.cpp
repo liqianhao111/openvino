@@ -124,7 +124,7 @@ static void CreateMOECompressedOp(ProgramBuilder& p, const std::shared_ptr<ov::o
         const size_t base_inputs = 12;
         const size_t shared_inputs = config.num_shared_expert > 0 ? 10 : 0;
         const size_t expected_inputs = base_inputs + shared_inputs;
-        validate_inputs_count(op, {expected_inputs});
+        validate_inputs_count(op, {expected_inputs, expected_inputs + 1});
 
         // Resolve OTD (offload-to-disk) parameters; no-op when OFFLOAD_RATIO == 0.
         std::vector<size_t> weight_bin_offsets;
@@ -133,7 +133,12 @@ static void CreateMOECompressedOp(ProgramBuilder& p, const std::shared_ptr<ov::o
         prepare_moe_otd_params(p, op, weight_bin_offsets, weights_path, lru_expert_num);
 
         const std::string layerName = layer_type_name_ID(op);
-        const cldnn::moe_3gemm_fused_compressed moe(layerName, input_infos, config, weight_bin_offsets, weights_path, lru_expert_num);
+        cldnn::moe_3gemm_fused_compressed moe(layerName, input_infos, config, weight_bin_offsets, weights_path, lru_expert_num);
+        const auto& rt_info = op->get_rt_info();
+        if (auto it = rt_info.find("moe_layer_index"); it != rt_info.end()) {
+            moe._otd.layer_index = it->second.as<int64_t>();
+        }
+        moe._otd.has_lookahead_hint = op->get_input_size() == expected_inputs + 1;
         p.add_primitive(*op, moe);
     } else {
         // Create GEMM2_BIAS_SWIGLU_CLAMP specific primitives

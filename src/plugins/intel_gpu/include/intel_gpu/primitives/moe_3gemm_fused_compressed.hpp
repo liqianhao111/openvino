@@ -36,16 +36,23 @@ struct moe_otd_descriptor {
     std::vector<size_t> weight_bin_offsets;
     std::filesystem::path weights_path;
     size_t lru_expert_num = 0;
+    // Execution order of this MoE layer among the model's MoE layers; -1 if unknown.
+    int64_t layer_index = -1;
+    // A trailing input carries the experts predicted for layer_index + 1.
+    bool has_lookahead_hint = false;
 
     bool operator==(const moe_otd_descriptor& rhs) const {
         return weight_bin_offsets == rhs.weight_bin_offsets && weights_path == rhs.weights_path &&
-               lru_expert_num == rhs.lru_expert_num;
+               lru_expert_num == rhs.lru_expert_num && layer_index == rhs.layer_index &&
+               has_lookahead_hint == rhs.has_lookahead_hint;
     }
 
     void save(BinaryOutputBuffer& ob) const {
         ob << weight_bin_offsets;
         ob << weights_path.string();
         ob << lru_expert_num;
+        ob << layer_index;
+        ob << has_lookahead_hint;
     }
 
     void load(BinaryInputBuffer& ib) {
@@ -54,6 +61,8 @@ struct moe_otd_descriptor {
         ib >> path_str;
         weights_path = path_str;
         ib >> lru_expert_num;
+        ib >> layer_index;
+        ib >> has_lookahead_hint;
     }
 };
 
@@ -130,6 +139,9 @@ struct moe_3gemm_fused_compressed : public primitive_base<moe_3gemm_fused_compre
     //                      shape [1, hidden_size, group_num, 1]
     //                   21: shared_gate_gate_weight - shared expert gate weight for gating,
     //                      shape [hidden_size]
+    //
+    //                   Optional last input (OTD lookahead, _otd.has_lookahead_hint): [num_tokens, k] i32 experts
+    //                   predicted for the next MoE layer.
     //
     moe_3gemm_fused_compressed(const primitive_id& id,
                                const std::vector<input_info>& inputs,

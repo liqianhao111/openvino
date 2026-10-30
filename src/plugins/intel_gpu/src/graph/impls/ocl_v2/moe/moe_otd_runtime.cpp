@@ -43,6 +43,10 @@ void OtdPerfCounters::dump() const {
               << ", batched_fallbacks=" << batched_fallbacks.load(std::memory_order_relaxed)
               << ", batched_split_passes=" << batched_split_passes.load(std::memory_order_relaxed)
               << ", split_wait_ms=" << split_wait_ns.load(std::memory_order_relaxed) / 1000000
+              << ", prefetch_issued=" << prefetch_issued.load(std::memory_order_relaxed)
+              << ", prefetch_hits=" << prefetch_hits.load(std::memory_order_relaxed)
+              << ", prefetch_wasted=" << prefetch_wasted.load(std::memory_order_relaxed)
+              << ", hint_readback_ms=" << hint_readback_ns.load(std::memory_order_relaxed) / 1000000
               << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
               << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed) << std::endl;
 }

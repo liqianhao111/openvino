@@ -9,6 +9,7 @@
 #include "openvino/runtime/shared_buffer.hpp"
 #include "lru_cache.hpp"
 #include "expert_weight_providers.hpp"
+#include "moe_otd_context.hpp"
 // clang-format on
 
 using ov::intel_gpu::ocl::moe::ExpertRequest;
@@ -693,6 +694,8 @@ public:
     int _gate_up_group_size;
     int _down_group_size;
     std::shared_ptr<IExpertWeightProvider> _weight_provider;
+    // Per-network registry of MoE layers for lookahead prefetch; set on first execution of a layer with a known index.
+    std::shared_ptr<moe::MoeOtdContext> _otd_ctx;
     // Owned by the impl: kernels reading it may still be in flight after execute() returns.
     memory::ptr _otd_expert_index_buffer;
     // Second-pass index of a split batched GEMV; written while the first pass still reads the buffer above.
@@ -777,6 +780,47 @@ public:
             instance._weights.down_s = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::SCALE_2));
             _weight_provider->bind(instance._weights);
         }
+        const auto& otd = instance.get_typed_desc<moe_3gemm_fused_compressed>()->_otd;
+        if (!_otd_ctx && otd.layer_index >= 0) {
+            _otd_ctx = moe::MoeOtdContext::get(&instance.get_network());
+            _otd_ctx->register_layer(otd.layer_index, _weight_provider);
+        }
+    }
+
+    // Starts loading the experts predicted for the next MoE layer. Called after stream.finish(), when no kernel of
+    // the next layer is in flight.
+    void prefetch_next_layer(cldnn::stream& stream, typed_primitive_inst<moe_3gemm_fused_compressed>& instance) {
+        const auto desc = instance.get_typed_desc<moe_3gemm_fused_compressed>();
+        if (!_otd_ctx || !desc->_otd.has_lookahead_hint) {
+            return;
+        }
+        auto next = _otd_ctx->layer(desc->_otd.layer_index + 1);
+        if (!next) {
+            return;
+        }
+        const size_t hint_idx = instance.dependencies().size() - 1;
+        const auto& hint_layout = instance.get_impl_params()->get_input_layout(hint_idx);
+        OPENVINO_ASSERT(hint_layout.data_type == data_types::i32, "MoE lookahead hint must be i32, got ", hint_layout.data_type);
+        std::vector<int32_t> hint(hint_layout.count());
+        {
+            auto* perf = moe_otd::get_perf_counters();
+            ScopedOtdTimer readback_timer(perf ? &perf->hint_readback_ns : nullptr);
+            instance.input_memory_ptr(hint_idx)->copy_to(stream, hint.data(), 0, 0, hint.size() * sizeof(int32_t), true);
+        }
+        // Union over tokens; keep half of the next layer's slots for its demand misses.
+        const size_t limit = std::max<size_t>(1, resident_slot_count() / 2);
+        std::vector<uint32_t> experts;
+        for (const int32_t e : hint) {
+            if (e < 0 || static_cast<size_t>(e) >= desc->_config.num_expert ||
+                std::find(experts.begin(), experts.end(), static_cast<uint32_t>(e)) != experts.end()) {
+                continue;
+            }
+            experts.push_back(static_cast<uint32_t>(e));
+            if (experts.size() == limit) {
+                break;
+            }
+        }
+        next->prefetch(experts, stream);
     }
 
     void prepare_weight_pointers(typed_primitive_inst<moe_3gemm_fused_compressed>& instance, scratch_buffers& scratch) {
@@ -795,7 +839,7 @@ public:
         }
 
         // Shared expert weight pointers (indices 12-21)
-        if (instance.dependencies().size() > static_cast<size_t>(MOE3GemmInputIndex::SHARED_GATE_WEIGHT)) {
+        if (instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config.num_shared_expert > 0) {
             scratch.moe_fusion_wei_addr.shared_weight[0] = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::SHARED_GATE_WEIGHT));
             scratch.moe_fusion_wei_addr.shared_scale[0] = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::SHARED_GATE_SCALE));
             scratch.moe_fusion_wei_addr.shared_zp[0] = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::SHARED_GATE_ZP));
@@ -847,6 +891,7 @@ public:
 
         otd_request = std::move(req);
         auto& r = *otd_request;
+        prefetch_next_layer(stream, instance);
 
         const size_t token_num = topk_count / top_k;
         moe_otd::record_route_trace(instance.id(), token_num, top_k, expert_ids);
@@ -1420,7 +1465,7 @@ public:
         auto hidden_states_layout = params.input_layouts[0];
         auto token_num = get_seq_len(hidden_states_layout);
         auto data_type = hidden_states_layout.data_type;
-        bool has_shared_expert = params.input_layouts.size() > static_cast<size_t>(MOE3GemmInputIndex::SHARED_GATE_WEIGHT);
+        bool has_shared_expert = config.num_shared_expert > 0;
 
         std::vector<BufferDescriptor> internal_buffers;
         // To support micro_gemm, prefill need to allocate max_topk * token_num for input data of micro_gemm

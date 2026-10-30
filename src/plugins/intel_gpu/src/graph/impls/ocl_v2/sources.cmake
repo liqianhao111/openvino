@@ -48,6 +48,8 @@ set(GPU_OCL_V2_IMPL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_gemm_gen_opt.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_mask_gen.cpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_mask_gen.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/moe_otd_context.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/moe_otd_context.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_otd_io.cpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_otd_io.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_otd_runtime.cpp

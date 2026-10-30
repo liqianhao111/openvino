@@ -81,6 +81,7 @@ public:
     std::optional<ExpertRequest> request(const std::vector<uint32_t>& experts, cldnn::stream& stream) override;
     void wait(ExpertRequest& request) override;
     void release(ExpertRequest& request) override;
+    void prefetch(const std::vector<uint32_t>& experts, cldnn::stream& stream) override;
 
     ExpertSlotCache& cache() {
         return *_cache;
@@ -93,7 +94,12 @@ public:
 private:
     // Starts loading (expert, slot) misses. Host-USM slots load on the IO engine and return the
     // in-flight handle; otherwise they load serially through the GPU queue and nullptr is returned.
-    std::shared_ptr<PendingExpertLoad> start_load(const std::vector<uint32_t>& experts, const std::vector<size_t>& slots, cldnn::stream& stream);
+    std::shared_ptr<PendingExpertLoad> start_load(const std::vector<uint32_t>& experts,
+                                                  const std::vector<size_t>& slots,
+                                                  const std::vector<uint64_t>& generations,
+                                                  cldnn::stream& stream,
+                                                  moe_otd::IoPriority priority = moe_otd::IoPriority::urgent);
+    bool supports_async_load();
 
     size_t _capacity = 0;
     cldnn::MOECompressed::Config _config{};

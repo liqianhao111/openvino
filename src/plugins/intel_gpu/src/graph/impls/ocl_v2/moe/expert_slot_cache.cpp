@@ -13,7 +13,7 @@ namespace ov::intel_gpu::ocl::moe {
 
 ExpertSlotCache::ExpertSlotCache(size_t capacity) : _slots(capacity) {}
 
-std::optional<std::vector<ExpertSlotCache::Acquired>> ExpertSlotCache::acquire(const std::vector<uint32_t>& experts) {
+std::optional<std::vector<ExpertSlotCache::Acquired>> ExpertSlotCache::acquire(const std::vector<uint32_t>& experts, bool prefetch) {
     std::lock_guard<std::mutex> lock(_mutex);
 
     std::vector<bool> is_hit_slot(_slots.size(), false);
@@ -52,11 +52,15 @@ std::optional<std::vector<ExpertSlotCache::Acquired>> ExpertSlotCache::acquire(c
             auto& slot = _slots[it->second];
             slot.last_use = ++_clock;
             ++slot.pins;
-            result.push_back({it->second, slot.state});
+            result.push_back({it->second, slot.state, slot.unused_prefetch && !prefetch, false, slot.generation});
+            if (!prefetch) {
+                slot.unused_prefetch = false;
+            }
             continue;
         }
         const size_t s = victims[next_victim++];
         auto& slot = _slots[s];
+        const bool evicted_unused_prefetch = slot.expert != no_expert && slot.unused_prefetch;
         if (slot.expert != no_expert) {
             _expert_to_slot.erase(slot.expert);
         }
@@ -64,8 +68,10 @@ std::optional<std::vector<ExpertSlotCache::Acquired>> ExpertSlotCache::acquire(c
         slot.expert = expert;
         slot.pins = 1;
         slot.last_use = ++_clock;
+        slot.generation = _clock;
+        slot.unused_prefetch = prefetch;
         _expert_to_slot.emplace(expert, s);
-        result.push_back({s, SlotState::empty});
+        result.push_back({s, SlotState::empty, false, evicted_unused_prefetch, slot.generation});
     }
     return result;
 }
@@ -76,18 +82,18 @@ void ExpertSlotCache::unpin(size_t slot) {
     --_slots[slot].pins;
 }
 
-void ExpertSlotCache::mark_ready(size_t slot) {
+void ExpertSlotCache::mark_ready(size_t slot, uint64_t generation) {
     std::lock_guard<std::mutex> lock(_mutex);
     auto& s = _slots.at(slot);
-    if (s.state == SlotState::loading) {
+    if (s.state == SlotState::loading && s.generation == generation) {
         s.state = SlotState::ready;
     }
 }
 
-void ExpertSlotCache::mark_failed(size_t slot) {
+void ExpertSlotCache::mark_failed(size_t slot, uint64_t generation) {
     std::lock_guard<std::mutex> lock(_mutex);
     auto& s = _slots.at(slot);
-    if (s.state != SlotState::loading) {
+    if (s.state != SlotState::loading || s.generation != generation) {
         return;
     }
     _expert_to_slot.erase(s.expert);

@@ -24,11 +24,13 @@ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
 #    include <chrono>
 #    include <cstdint>
 #    include <cstring>
+#    include <deque>
 #    include <fstream>
 #    include <initializer_list>
 #    include <iostream>
 #    include <limits>
 #    include <mutex>
+#    include <numeric>
 #    include <oneapi/dnnl/dnnl.hpp>
 #    include <oneapi/dnnl/dnnl_ocl.hpp>
 #    include <optional>
@@ -700,6 +702,13 @@ public:
     memory::ptr _otd_expert_index_buffer;
     // Second-pass index of a split batched GEMV; written while the first pass still reads the buffer above.
     memory::ptr _otd_expert_index_buffer_pass2;
+    // Per-layer metadata of the streamed grouped OTD prefill, staged on the host and copied in queue order.
+    memory::ptr _otd_prefill_token_idx;
+    memory::ptr _otd_prefill_row_lut;
+    memory::ptr _otd_prefill_offsets;
+    std::vector<int32_t> _otd_prefill_token_idx_host;
+    std::vector<int32_t> _otd_prefill_row_lut_host;
+    std::vector<int32_t> _otd_prefill_offsets_host;
 
     // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
 
@@ -940,16 +949,10 @@ public:
         needs_fallback = false;
     }
 
-    bool on_load_expert_weights(size_t expert_no, typed_primitive_inst<moe_3gemm_fused_compressed>& instance, dnnl::stream& dnn_stream) {
-        if (!_weight_provider->is_offloaded()) {
-            return false;
-        }
-
-        dnn_stream.wait();
-
-        auto& stream = instance.get_network().get_stream();
+    // Points _dnnl_weights[expert_no] at the OTD slot that holds the expert.
+    void bind_dnnl_weights_to_slot(size_t expert_no, size_t slot, typed_primitive_inst<moe_3gemm_fused_compressed>& instance) {
         auto& dnnl_weights = _dnnl_weights[expert_no];
-        auto lru_expert_no = static_cast<int64_t>(_weight_provider->acquire_one(static_cast<uint32_t>(expert_no), stream));
+        auto lru_expert_no = static_cast<int64_t>(slot);
         auto& params = instance._weights;
 
 #    define CONVERT_DNNL_OTD(name, i)                                                                                                                  \
@@ -971,7 +974,6 @@ public:
         CONVERT_DNNL_OTD(up, 1)
         CONVERT_DNNL_OTD(down, 2)
 #    undef CONVERT_DNNL_OTD
-        return true;
     }
 
     int get_num_grouped_experts(int num_total_experts) {
@@ -1617,12 +1619,6 @@ public:
         }
     }
 
-    void copy_expert_mask_to_gpu(stream& stream, const expert_mask_cpu& expert_mask, size_t expert_no, expert_mask_gpu& expert_mask_mem) {
-        auto size = expert_mask.batch[expert_no].size() * sizeof(int);
-        expert_mask_mem.batch->copy_from(stream, expert_mask.batch[expert_no].data(), 0, 0, size, true);
-        expert_mask_mem.topk->copy_from(stream, expert_mask.topk[expert_no].data(), 0, 0, size, true);
-    }
-
     cldnn::event::ptr execute_stage(const std::vector<cldnn::event::ptr>& events,
                                     cldnn::primitive_inst& instance,
                                     Stage& stage,
@@ -2189,7 +2185,7 @@ public:
             }
             auto& kernel = *_kernels.get(std::make_pair(n_token, 0));
             // Patch weight memory handles for the current expert's LRU slot.
-            // on_load_expert_weights already updated _dnnl_weights[expert_no] with
+            // bind_dnnl_weights_to_slot already updated _dnnl_weights[expert_no] with
             // the correct slot offset, so copy those handles to the cached kernel.
             auto& dw = _dnnl_weights[expert_no];
             kernel.gate.weight = dw[0].weight;
@@ -2415,23 +2411,12 @@ public:
         auto token_num = get_seq_len(hidden_states_layout);
         expert_mask_cpu expert_mask;
         get_expert_mask_from_gpu(config, topk_id_mem, stream, expert_mask, token_num, instance.id());
+        upload_expert_masks(stream, instance, expert_mask, token_num);
 
-        for (size_t expert_no = 0; expert_no < config.num_expert; expert_no++) {
-            if (expert_no >= expert_mask.pred_flag.size()) {
-                OPENVINO_THROW("expert_no=", expert_no, " is out of bounds");
-            }
-            auto can_skip_subgraph = expert_mask.pred_flag[expert_no] == 0;
-            if (can_skip_subgraph) {
-                continue;
-            }
-
-            on_load_expert_weights(expert_no, instance, dnn_stream);
+        // gather -> up/gate/down -> index_add into the output for one expert whose weights are bound in _dnnl_weights.
+        auto compute_expert = [&](size_t expert_no) {
             auto& dnnl_weights = _dnnl_weights[expert_no];
-
-            // expert_mask
             expert_mask_gpu& expert_mask_mem = scratch.expert_masks[expert_no];
-            copy_expert_mask_to_gpu(stream, expert_mask, expert_no, expert_mask_mem);
-
             auto n_token = static_cast<int>(expert_mask.batch[expert_no].size());
 
             // Be careful about possible overflow
@@ -2479,9 +2464,118 @@ public:
                                          {static_cast<size_t>(n_token), static_cast<size_t>(_hidden_size)},
                                          {1, lws_size},
                                          true /*instance.needs_completion_event()*/);
+        };
+
+        std::vector<uint32_t> used_experts;
+        for (size_t expert_no = 0; expert_no < config.num_expert; expert_no++) {
+            if (expert_mask.pred_flag[expert_no] != 0) {
+                used_experts.push_back(static_cast<uint32_t>(expert_no));
+            }
         }
 
+        if (!_weight_provider->is_offloaded()) {
+            for (const uint32_t expert_no : used_experts) {
+                compute_expert(expert_no);
+            }
+            return result_event;
+        }
+
+        // OTD: experts are computed in ascending id order (as before, so index_add accumulates identically) while the
+        // loads of up to half the slots run ahead on the IO engine. A computed expert keeps its slot pinned until its
+        // index_add has finished on the GPU, so no load can overwrite weights a queued kernel still reads.
+        struct Computed {
+            ExpertRequest request;
+            cldnn::event::ptr done;
+        };
+        std::deque<std::pair<uint32_t, ExpertRequest>> loading;
+        std::deque<Computed> computed;
+        auto release_all = [&] {
+            for (auto& entry : loading) {
+                _weight_provider->release(entry.second);
+            }
+            for (auto& entry : computed) {
+                _weight_provider->release(entry.request);
+            }
+        };
+        auto release_oldest_computed = [&](bool block) {
+            auto& oldest = computed.front();
+            if (oldest.done && !oldest.done->is_set()) {
+                if (!block) {
+                    return false;
+                }
+                oldest.done->wait();
+            } else if (!oldest.done && block) {
+                dnn_stream.wait();
+            }
+            _weight_provider->release(oldest.request);
+            computed.pop_front();
+            return true;
+        };
+
+        auto* perf = moe_otd::get_perf_counters();
+        const size_t window = std::max<size_t>(1, resident_slot_count() / 2);
+        size_t next_issue = 0;
+        try {
+            for (const uint32_t expert_no : used_experts) {
+                while (!computed.empty() && release_oldest_computed(false)) {
+                }
+                while (next_issue < used_experts.size() && loading.size() < window) {
+                    auto req = _weight_provider->request({used_experts[next_issue]}, stream);
+                    if (req) {
+                        loading.emplace_back(used_experts[next_issue++], std::move(*req));
+                        continue;
+                    }
+                    if (computed.empty()) {
+                        if (!loading.empty()) {
+                            break;
+                        }
+                        // Only unpinned LOADING slots (in-flight prefetches) are in the way; they finish on their own.
+                        std::this_thread::yield();
+                        continue;
+                    }
+                    if (perf) {
+                        perf->prefill_slot_stalls.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    release_oldest_computed(true);
+                }
+                OPENVINO_ASSERT(!loading.empty() && loading.front().first == expert_no, "MoE OTD prefill pipeline out of order");
+
+                auto& req = loading.front().second;
+                if (!req.all_ready()) {
+                    // Let the GPU run the queued experts while this one finishes loading.
+                    stream.flush();
+                    ScopedOtdTimer wait_timer(perf ? &perf->prefill_io_wait_ns : nullptr);
+                    _weight_provider->wait(req);
+                }
+                bind_dnnl_weights_to_slot(expert_no, req.slots[0], instance);
+                compute_expert(expert_no);
+                computed.push_back({std::move(req), result_event});
+                loading.pop_front();
+            }
+        } catch (...) {
+            release_all();
+            throw;
+        }
+        release_all();
         return result_event;
+    }
+
+    // One upload per buffer instead of two blocking copies per expert; rows of unused experts are left untouched.
+    void upload_expert_masks(cldnn::stream& stream,
+                             typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                             const expert_mask_cpu& expert_mask,
+                             size_t token_num) {
+        const size_t expert_num = expert_mask.batch.size();
+        std::vector<int32_t> batch(expert_num * token_num, 0);
+        std::vector<int32_t> topk(expert_num * token_num, 0);
+        for (size_t e = 0; e < expert_num; ++e) {
+            std::copy(expert_mask.batch[e].begin(), expert_mask.batch[e].end(), batch.begin() + e * token_num);
+            std::copy(expert_mask.topk[e].begin(), expert_mask.topk[e].end(), topk.begin() + e * token_num);
+        }
+        const auto& intermediates = instance.get_intermediates_memories();
+        const size_t bytes = batch.size() * sizeof(int32_t);
+        intermediates[MOE_INTERNAL_BUFFER_EXPERT_MASK_BATCH]->copy_from(stream, batch.data(), 0, 0, bytes, true);
+        intermediates[MOE_INTERNAL_BUFFER_EXPERT_MASK_TOPK]->copy_from(stream, topk.data(), 0, 0, bytes, true);
     }
 
     cldnn::event::ptr exec_prefill_onednn_fallback(const std::vector<cldnn::event::ptr>& events,
@@ -2747,6 +2841,255 @@ public:
         return ret_event;
     }
 
+    // OTD prefill with grouped GEMMs, streamed: the layer's used experts (ascending id) are split into small chunks that
+    // are requested as far ahead as free slots allow, so later chunks load while earlier ones compute. Every chunk
+    // writes its own rows of the flat buffers and a single scatter_reduce combines them, so per-row results and the
+    // final sum do not depend on the chunking.
+    cldnn::event::ptr exec_prefill_grouped_otd(const std::vector<cldnn::event::ptr>& events,
+                                               cldnn::stream& stream,
+                                               typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                                               scratch_buffers& scratch) {
+        auto* perf = moe_otd::get_perf_counters();
+        if (perf) {
+            perf->prefill_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
+        ScopedOtdTimer prefill_timer(perf ? &perf->prefill_fallback_ns : nullptr);
+
+        const auto& config = instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config;
+        auto& dnn_stream = stream.get_onednn_stream();
+        auto& engine = instance.get_network().get_engine();
+        const auto hidden_states_mem_ptr = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
+        auto hidden_states_layout = std::get<1>(get_input_info(instance, static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES)));
+        const size_t token_num = get_seq_len(hidden_states_layout);
+        const size_t max_topk = config.top_k;
+        const size_t total_rows = token_num * max_topk;
+        const size_t num_slots = resident_slot_count();
+
+        expert_mask_cpu expert_mask;
+        get_expert_mask_from_gpu(config, scratch.topk_id, stream, expert_mask, token_num, instance.id());
+        std::vector<uint32_t> used_experts;
+        for (size_t e = 0; e < config.num_expert; ++e) {
+            if (expert_mask.pred_flag[e] != 0) {
+                used_experts.push_back(static_cast<uint32_t>(e));
+            }
+        }
+        // Small enough that several chunks load while one computes; slots/4 measured best on B390 (r90/r45/r15).
+        const size_t chunk_experts = std::max<size_t>(1, num_slots / 4);
+        const size_t num_chunks = (used_experts.size() + chunk_experts - 1) / chunk_experts;
+
+        // Metadata is staged on the host and uploaded with in-order queue copies, so it never changes under a running kernel.
+        // The staging vectors are members: the non-blocking copies read them after this function returns.
+        auto device_i32 = [&](memory::ptr& buffer, size_t count) {
+            if (!buffer || buffer->get_layout().count() < count) {
+                buffer = engine.allocate_memory(cldnn::layout(ov::Shape{count}, data_types::i32, format::bfyx), allocation_type::usm_device, false);
+            }
+        };
+        device_i32(_otd_prefill_token_idx, total_rows);
+        device_i32(_otd_prefill_row_lut, total_rows);
+        device_i32(_otd_prefill_offsets, std::max<size_t>(1, num_chunks) * num_slots);
+        _otd_prefill_token_idx_host.assign(total_rows, 0);
+        _otd_prefill_row_lut_host.assign(total_rows, -1);
+        _otd_prefill_offsets_host.assign(std::max<size_t>(1, num_chunks) * num_slots, 0);
+        int32_t* token_idx = _otd_prefill_token_idx_host.data();
+        int32_t* row_lut = _otd_prefill_row_lut_host.data();
+        int32_t* offsets = _otd_prefill_offsets_host.data();
+
+        struct Chunk {
+            size_t first = 0;
+            size_t count = 0;
+            size_t row_start = 0;
+            size_t rows = 0;
+            int32_t max_rows_per_expert = 0;
+            std::optional<ExpertRequest> request;
+            cldnn::event::ptr done;
+        };
+        std::vector<Chunk> chunks(num_chunks);
+        for (size_t c = 0; c < num_chunks; ++c) {
+            chunks[c].first = c * chunk_experts;
+            chunks[c].count = std::min(chunk_experts, used_experts.size() - chunks[c].first);
+        }
+        size_t next_row = 0;
+
+        // Requests the chunk's experts and lays out its rows grouped by slot (the grouped GEMM's group index).
+        auto issue = [&](size_t c) {
+            auto& chunk = chunks[c];
+            const std::vector<uint32_t> experts(used_experts.begin() + chunk.first, used_experts.begin() + chunk.first + chunk.count);
+            auto req = _weight_provider->request(experts, stream);
+            if (!req) {
+                return false;
+            }
+            std::vector<size_t> order(experts.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                return req->slots[a] < req->slots[b];
+            });
+            int32_t* chunk_offsets = offsets + c * num_slots;
+            std::fill(chunk_offsets, chunk_offsets + num_slots, 0);
+            chunk.row_start = next_row;
+            for (const size_t i : order) {
+                const uint32_t e = experts[i];
+                const auto n = static_cast<int32_t>(expert_mask.batch[e].size());
+                for (int32_t j = 0; j < n; ++j) {
+                    token_idx[next_row] = expert_mask.batch[e][j];
+                    row_lut[expert_mask.topk[e][j]] = static_cast<int32_t>(next_row);
+                    ++next_row;
+                }
+                chunk_offsets[req->slots[i]] = n;
+                chunk.max_rows_per_expert = std::max(chunk.max_rows_per_expert, n);
+            }
+            for (size_t s = 1; s < num_slots; ++s) {
+                chunk_offsets[s] += chunk_offsets[s - 1];
+            }
+            chunk.rows = next_row - chunk.row_start;
+            chunk.request = std::move(req);
+            _otd_prefill_token_idx->copy_from(stream, token_idx, chunk.row_start * sizeof(int32_t), chunk.row_start * sizeof(int32_t), chunk.rows * sizeof(int32_t), false);
+            _otd_prefill_offsets->copy_from(stream, offsets, c * num_slots * sizeof(int32_t), c * num_slots * sizeof(int32_t), num_slots * sizeof(int32_t), false);
+            return true;
+        };
+        auto release = [&](Chunk& chunk, bool wait_gpu) {
+            if (!chunk.request) {
+                return;
+            }
+            if (wait_gpu && chunk.done) {
+                chunk.done->wait();
+            }
+            _weight_provider->release(*chunk.request);
+            chunk.request.reset();
+        };
+        // Issues chunk c, waiting for computed chunks to leave the GPU (or in-flight prefetches to land) if slots are short.
+        auto issue_blocking = [&](size_t c) {
+            size_t oldest = 0;
+            while (!issue(c)) {
+                if (perf) {
+                    perf->prefill_slot_stalls.fetch_add(1, std::memory_order_relaxed);
+                }
+                while (oldest < c && !(chunks[oldest].request && chunks[oldest].done)) {
+                    ++oldest;
+                }
+                if (oldest < c) {
+                    release(chunks[oldest], true);
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        };
+
+        auto& gk = get_grouped_kernel(static_cast<int>(total_rows), instance);
+        const size_t dt_size = ov::element::Type(scratch.x->get_layout().data_type).size();
+        const size_t subgroup_size = instance.get_impl_params()->get_device_info().arch >= gpu_arch::xe2 ? 32 : 16;
+        const size_t gather_threads = std::get<0>(
+            calc_thread_count(const_cast<RuntimeParams&>(*instance.get_impl_params()), get_vec_size(*instance.get_impl_params()), _hidden_size));
+        cldnn::event::ptr ret_event = events.empty() ? nullptr : events[0];
+
+        auto row_view = [&](const memory::ptr& mem, const Chunk& chunk, size_t row_elems) {
+            return engine.create_subbuffer(*mem,
+                                           cldnn::layout(ov::Shape{chunk.rows, row_elems}, mem->get_layout().data_type, format::bfyx),
+                                           chunk.row_start * row_elems * dt_size);
+        };
+        auto grouped_matmul = [&](const dnnl::matmul& prim,
+                                  const dnnl::matmul::primitive_desc& pd,
+                                  const dnnl::memory::desc& scale_md,
+                                  const dnnl::memory::desc& zp_md,
+                                  size_t w,
+                                  const memory::ptr& src,
+                                  const memory::ptr& dst,
+                                  const memory& chunk_offsets,
+                                  const dnnl::memory& hint) {
+            std::unordered_map<int, dnnl::memory> args{
+                {DNNL_ARG_SRC, src->get_onednn_grouped_memory(pd.src_desc(), chunk_offsets)},
+                {DNNL_ARG_WEIGHTS, scratch.moe_fusion_wei_addr.weight[w]->get_onednn_memory(pd.weights_desc())},
+                {DNNL_ARG_DST, dst->get_onednn_grouped_memory(pd.dst_desc(), chunk_offsets)},
+                {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scratch.moe_fusion_wei_addr.scale[w]->get_onednn_memory(scale_md)},
+                {DNNL_ARG_HINT_MAX_GROUP_SIZE, hint}};
+            if (gk.has_zp) {
+                args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, scratch.moe_fusion_wei_addr.zp[w]->get_onednn_memory(zp_md)});
+            }
+            prim.execute(dnn_stream, args);
+        };
+        auto compute = [&](size_t c) {
+            auto& chunk = chunks[c];
+            auto x = row_view(scratch.x, chunk, static_cast<size_t>(_hidden_size));
+            auto up = row_view(scratch.up, chunk, static_cast<size_t>(_intermediate_size));
+            auto gate = row_view(scratch.gate, chunk, static_cast<size_t>(_intermediate_size));
+            auto y = row_view(scratch.y, chunk, static_cast<size_t>(_hidden_size));
+            auto idx = engine.create_subbuffer(*_otd_prefill_token_idx,
+                                               cldnn::layout(ov::Shape{chunk.rows}, data_types::i32, format::bfyx),
+                                               chunk.row_start * sizeof(int32_t));
+            auto chunk_offsets = engine.create_subbuffer(*_otd_prefill_offsets,
+                                                         cldnn::layout(ov::Shape{num_slots}, data_types::i32, format::bfyx),
+                                                         c * num_slots * sizeof(int32_t));
+            dnnl::memory hint(dnnl::memory::desc::host_scalar(dnnl::memory::data_type::s32), chunk.max_rows_per_expert);
+
+            ret_event = execute_stage({ret_event},
+                                      instance,
+                                      *grouped_gemm_prefill_gather,
+                                      {hidden_states_mem_ptr, idx},
+                                      {x},
+                                      {chunk.rows * gather_threads, 1, 1},
+                                      {gather_threads, 1, 1});
+            grouped_matmul(gk.gate_prim, gk.gate_pd, gk.gate_scale_md, gk.gate_zp_md, 0, x, gate, *chunk_offsets, hint);
+            grouped_matmul(gk.up_prim, gk.up_pd, gk.up_scale_md, gk.up_zp_md, 1, x, up, *chunk_offsets, hint);
+            ret_event = execute_stage({ret_event},
+                                      instance,
+                                      *grouped_gemm_prefill_swiglu,
+                                      {up, gate},
+                                      {gate},
+                                      {static_cast<size_t>(_intermediate_size), chunk.rows, 1},
+                                      {subgroup_size, 1, 1});
+            grouped_matmul(gk.down_prim, gk.down_pd, gk.down_scale_md, gk.down_zp_md, 2, gate, y, *chunk_offsets, hint);
+            chunk.done = stream.enqueue_marker({}, true);
+        };
+
+        try {
+            size_t next_issue = 0;
+            auto top_up = [&] {
+                while (next_issue < num_chunks && issue(next_issue)) {
+                    ++next_issue;
+                }
+            };
+            for (size_t c = 0; c < num_chunks; ++c) {
+                if (next_issue == c) {
+                    issue_blocking(c);
+                    ++next_issue;
+                }
+                top_up();
+                if (!chunks[c].request->all_ready()) {
+                    stream.flush();
+                    ScopedOtdTimer wait_timer(perf ? &perf->prefill_io_wait_ns : nullptr);
+                    _weight_provider->wait(*chunks[c].request);
+                }
+                compute(c);
+                stream.flush();
+                // Hand the slots of chunks the GPU has finished to the next loads.
+                for (size_t k = 0; k < c; ++k) {
+                    if (chunks[k].request && chunks[k].done->is_set()) {
+                        release(chunks[k], false);
+                    }
+                }
+                top_up();
+            }
+        } catch (...) {
+            for (auto& chunk : chunks) {
+                release(chunk, false);
+            }
+            throw;
+        }
+        for (auto& chunk : chunks) {
+            release(chunk, false);
+        }
+
+        auto [reduce_threads, reduce_batches, reduce_unused] = calc_thread_count(const_cast<RuntimeParams&>(*instance.get_impl_params()), 4, _hidden_size);
+        _otd_prefill_row_lut->copy_from(stream, row_lut, 0, 0, total_rows * sizeof(int32_t), false);
+        return execute_stage({ret_event},
+                             instance,
+                             *prefill_scatter_reduce_row_lut,
+                             {scratch.y, scratch.topk_weights, _otd_prefill_row_lut},
+                             {instance.output_memory_ptr(0)},
+                             {token_num * reduce_threads, 1, 1},
+                             {reduce_threads, 1, 1},
+                             true /*needs_completion_event*/);
+    }
+
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& ins) override {
         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("moe_3gemm_swiglu_opt_impl::execute"));
         auto& instance = reinterpret_cast<typed_primitive_inst<moe_3gemm_fused_compressed>&>(ins);
@@ -2797,7 +3140,7 @@ public:
         // and does not require pre-zeroing — except in OTD mode where the
         // fallback to exec_prefill_onednn (when unique_experts > lru slots)
         // also accumulates via index_add.
-        if (!use_micro_gemm_prefill && should_pre_zero_output()) {
+        if ((!use_micro_gemm_prefill || _weight_provider->is_offloaded()) && should_pre_zero_output()) {
             final_hidden_states_mem_ptr->fill(stream, 0u);
         }
         // GPU mask gen is only supported for micro_gemm; both grouped_gemm and onednn loop
@@ -2816,7 +3159,13 @@ public:
                                << ", use_micro_gemm_prefill=" << use_micro_gemm_prefill << ", use_grouped_gemm_prefill=" << use_grouped_gemm_prefill
                                << std::endl;
         update_rt_params(instance);
-        if (use_micro_gemm_prefill) {
+        if (_weight_provider->is_offloaded()) {
+            // Both OTD prefill paths overlap expert loads with compute, and their numerics do not depend on whether a
+            // layer's experts happen to fit in the slots.
+            ret_env = use_grouped_gemm_prefill ? exec_prefill_grouped_otd(events, stream, instance, scratch)
+                                               : exec_prefill_onednn_fallback(events, stream, instance, scratch);
+            on_after_exec_sync(stream);
+        } else if (use_micro_gemm_prefill) {
             ret_env = exec_prefill_micro_gemm(events, instance, scratch, use_gpu_mask_gen);
         } else if (use_grouped_gemm_prefill) {
             ret_env = exec_prefill_grouped_gemm(events, stream, instance, scratch);

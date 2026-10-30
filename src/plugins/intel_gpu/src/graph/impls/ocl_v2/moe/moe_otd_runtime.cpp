@@ -33,6 +33,8 @@ void OtdPerfCounters::dump() const {
               << ", batched_gemv_prepare_ms=" << batched_gemv_prepare_ns.load(std::memory_order_relaxed) / 1000000
               << ", prefill_fallbacks=" << prefill_fallbacks.load(std::memory_order_relaxed)
               << ", prefill_fallback_ms=" << prefill_fallback_ns.load(std::memory_order_relaxed) / 1000000
+              << ", prefill_io_wait_ms=" << prefill_io_wait_ns.load(std::memory_order_relaxed) / 1000000
+              << ", prefill_slot_stalls=" << prefill_slot_stalls.load(std::memory_order_relaxed)
               << ", total_disk_io_ms=" << disk_io_ns.load(std::memory_order_relaxed) / 1000000
               << ", total_transpose_ms=" << transpose_ns.load(std::memory_order_relaxed) / 1000000
               << ", total_gpu_copy_ms=" << gpu_copy_ns.load(std::memory_order_relaxed) / 1000000

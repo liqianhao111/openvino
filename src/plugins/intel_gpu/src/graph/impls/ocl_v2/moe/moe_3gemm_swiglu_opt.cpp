@@ -3402,7 +3402,6 @@ public:
 
         auto& gk = get_grouped_kernel(static_cast<int>(total_rows), instance);
         const size_t dt_size = ov::element::Type(scratch.x->get_layout().data_type).size();
-        const size_t subgroup_size = instance.get_impl_params()->get_device_info().arch >= gpu_arch::xe2 ? 32 : 16;
         const size_t gather_threads = std::get<0>(
             calc_thread_count(const_cast<RuntimeParams&>(*instance.get_impl_params()), get_vec_size(*instance.get_impl_params()), _hidden_size));
         cldnn::event::ptr ret_event = events.empty() ? nullptr : events[0];
@@ -3420,7 +3419,8 @@ public:
                                   const memory::ptr& src,
                                   const memory::ptr& dst,
                                   const memory& chunk_offsets,
-                                  const dnnl::memory& hint) {
+                                  const dnnl::memory& hint,
+                                  const memory::ptr& bin_src) {
             std::unordered_map<int, dnnl::memory> args{
                 {DNNL_ARG_SRC, src->get_onednn_grouped_memory(pd.src_desc(), chunk_offsets)},
                 {DNNL_ARG_WEIGHTS, scratch.moe_fusion_wei_addr.weight[w]->get_onednn_memory(pd.weights_desc())},
@@ -3428,7 +3428,11 @@ public:
                 {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scratch.moe_fusion_wei_addr.scale[w]->get_onednn_memory(scale_md)},
                 {DNNL_ARG_HINT_MAX_GROUP_SIZE, hint}};
             if (gk.has_zp) {
-                args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, scratch.moe_fusion_wei_addr.zp[w]->get_onednn_memory(zp_md)});
+                const auto& host_zp = _grouped_zp_host_scalars[w];
+                args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, host_zp ? host_zp : scratch.moe_fusion_wei_addr.zp[w]->get_onednn_memory(zp_md)});
+            }
+            if (bin_src) {
+                args.insert({DNNL_ARG_ATTR_MULTIPLE_POST_OP(gk.gate_bin_po_idx) | DNNL_ARG_SRC_1, bin_src->get_onednn_grouped_memory(pd.dst_desc(), chunk_offsets)});
             }
             prim.execute(dnn_stream, args);
         };
@@ -3453,16 +3457,10 @@ public:
                                       {x},
                                       {chunk.rows * gather_threads, 1, 1},
                                       {gather_threads, 1, 1});
-            grouped_matmul(gk.gate_prim, gk.gate_pd, gk.gate_scale_md, gk.gate_zp_md, 0, x, gate, *chunk_offsets, hint);
-            grouped_matmul(gk.up_prim, gk.up_pd, gk.up_scale_md, gk.up_zp_md, 1, x, up, *chunk_offsets, hint);
-            ret_event = execute_stage({ret_event},
-                                      instance,
-                                      *grouped_gemm_prefill_swiglu,
-                                      {up, gate},
-                                      {gate},
-                                      {static_cast<size_t>(_intermediate_size), chunk.rows, 1},
-                                      {subgroup_size, 1, 1});
-            grouped_matmul(gk.down_prim, gk.down_pd, gk.down_scale_md, gk.down_zp_md, 2, gate, y, *chunk_offsets, hint);
+            // The gate GEMM fuses act(gate) * up as post-ops, so up must run first.
+            grouped_matmul(gk.up_prim, gk.up_pd, gk.up_scale_md, gk.up_zp_md, 1, x, up, *chunk_offsets, hint, nullptr);
+            grouped_matmul(gk.gate_prim, gk.gate_pd, gk.gate_scale_md, gk.gate_zp_md, 0, x, gate, *chunk_offsets, hint, up);
+            grouped_matmul(gk.down_prim, gk.down_pd, gk.down_scale_md, gk.down_zp_md, 2, gate, y, *chunk_offsets, hint, nullptr);
             chunk.done = stream.enqueue_marker({}, true);
         };
 
@@ -3570,7 +3568,7 @@ public:
         // and does not require pre-zeroing — except in OTD mode where the
         // fallback to exec_per_expert_onednn_linear (when unique_experts > lru slots)
         // also accumulates via index_add.
-    if ((impl != MoeGemmImpl::micro_gemm || _weight_provider->is_offloaded()) && should_pre_zero_output()) {
+        if ((impl != MoeGemmImpl::micro_gemm || _weight_provider->is_offloaded()) && should_pre_zero_output()) {
             final_hidden_states_mem_ptr->fill(stream, 0u);
         }
         const bool use_gpu_mask_gen = should_use_gpu_mask_gen(impl, token_num);
@@ -3589,10 +3587,10 @@ public:
         if (_weight_provider->is_offloaded()) {
             // Both OTD prefill paths overlap expert loads with compute, and their numerics do not depend on whether a
             // layer's experts happen to fit in the slots.
-        ret_env = prefill_impl == MoeGemmImpl::grouped_gemm ? exec_prefill_grouped_otd(events, stream, instance, scratch)
-                                : exec_prefill_onednn_fallback(events, stream, instance, scratch);
+            ret_env = prefill_impl == MoeGemmImpl::grouped_gemm ? exec_prefill_grouped_otd(events, stream, instance, scratch)
+                                                                : exec_prefill_onednn_fallback(events, stream, instance, scratch);
             on_after_exec_sync(stream);
-    } else if (impl == MoeGemmImpl::micro_gemm) {
+        } else if (impl == MoeGemmImpl::micro_gemm) {
             ret_env = exec_prefill_micro_gemm(events, instance, scratch, use_gpu_mask_gen);
         } else if (impl == MoeGemmImpl::grouped_gemm) {
             ret_env = use_gpu_mask_gen ? exec_grouped_gemm_gpu_mask_gen(events, stream, instance, scratch)

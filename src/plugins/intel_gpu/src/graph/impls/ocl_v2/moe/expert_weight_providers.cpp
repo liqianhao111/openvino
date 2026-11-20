@@ -8,6 +8,7 @@
 #include <atomic>
 #include <exception>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -301,21 +302,71 @@ std::shared_ptr<PendingExpertLoad> OffloadExpertWeightProvider::start_load(const
                                         *_resident,
                                         experts[i],
                                         slots[i],
-                                        moe_otd::direct_read_chunk_bytes,
+                                        moe_otd::direct_read_chunk_bytes(),
                                         pending->loads);
         pending->remaining_tasks[i].store(pending->loads.size() - first, std::memory_order_relaxed);
         load_expert.resize(pending->loads.size(), i);
     }
 
-    std::vector<moe_otd::MoeIoEngine::Task> tasks;
-    tasks.reserve(pending->loads.size());
-    for (size_t l = 0; l < pending->loads.size(); ++l) {
-        tasks.emplace_back([p = pending.get(), l, e = load_expert[l]](moe_otd::IoWorkerContext& context) {
-            moe_otd::execute_direct_host_load(p->config, p->loads[l], p->weights_path, context);
-            if (p->remaining_tasks[e].fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                p->cache->mark_ready(p->slots[e], p->generations[e]);
-            }
+    // Each group of file-contiguous loads (same tensor, adjacent experts) becomes one read request.
+    const auto& loads = pending->loads;
+    std::vector<std::vector<size_t>> groups;
+    if (const size_t limit = moe_otd::coalesce_limit_bytes(); limit > 0) {
+        std::vector<size_t> order(loads.size());
+        for (size_t l = 0; l < order.size(); ++l) {
+            order[l] = l;
+        }
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return std::tie(loads[a].offset_pos, loads[a].file_offset) < std::tie(loads[b].offset_pos, loads[b].file_offset);
         });
+        for (size_t l : order) {
+            if (!groups.empty()) {
+                auto& group = groups.back();
+                const auto& prev = loads[group.back()];
+                const auto& cur = loads[l];
+                if (cur.offset_pos == prev.offset_pos && cur.file_offset == prev.file_offset + prev.size &&
+                    cur.file_offset + cur.size - loads[group.front()].file_offset <= limit) {
+                    group.push_back(l);
+                    continue;
+                }
+            }
+            groups.push_back({l});
+        }
+        // Keep the original expert-major order so the first experts still become ready first.
+        std::sort(groups.begin(), groups.end(), [](const std::vector<size_t>& a, const std::vector<size_t>& b) {
+            return *std::min_element(a.begin(), a.end()) < *std::min_element(b.begin(), b.end());
+        });
+    }
+
+    std::vector<moe_otd::MoeIoEngine::Task> tasks;
+    if (groups.empty()) {
+        tasks.reserve(loads.size());
+        for (size_t l = 0; l < loads.size(); ++l) {
+            tasks.emplace_back([p = pending.get(), l, e = load_expert[l]](moe_otd::IoWorkerContext& context) {
+                moe_otd::execute_direct_host_load(p->config, p->loads[l], p->weights_path, context);
+                if (p->remaining_tasks[e].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    p->cache->mark_ready(p->slots[e], p->generations[e]);
+                }
+            });
+        }
+    } else {
+        tasks.reserve(groups.size());
+        for (auto& group : groups) {
+            std::vector<size_t> group_experts;
+            group_experts.reserve(group.size());
+            for (size_t l : group) {
+                group_experts.push_back(load_expert[l]);
+            }
+            tasks.emplace_back([p = pending.get(), group = std::move(group), group_experts = std::move(group_experts)](
+                                   moe_otd::IoWorkerContext& context) {
+                moe_otd::execute_coalesced_host_loads(p->config, p->loads, group, p->weights_path, context);
+                for (size_t e : group_experts) {
+                    if (p->remaining_tasks[e].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        p->cache->mark_ready(p->slots[e], p->generations[e]);
+                    }
+                }
+            });
+        }
     }
 
     if (auto* perf = moe_otd::get_perf_counters()) {

@@ -50,7 +50,34 @@ void OtdPerfCounters::dump() const {
               << ", prefetch_wasted=" << prefetch_wasted.load(std::memory_order_relaxed)
               << ", hint_readback_ms=" << hint_readback_ns.load(std::memory_order_relaxed) / 1000000
               << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
-              << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed) << std::endl;
+              << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed)
+              << ", coalesced_loads=" << coalesced_loads.load(std::memory_order_relaxed) << std::endl;
+}
+
+namespace {
+
+size_t env_kb_to_bytes(const char* name, size_t default_kb) {
+    size_t kb = default_kb;
+    if (const char* env = std::getenv(name); env && *env) {
+        char* end = nullptr;
+        const unsigned long value = std::strtoul(env, &end, 10);
+        if (end != env && *end == '\0') {
+            kb = static_cast<size_t>(value);
+        }
+    }
+    return kb * 1024;
+}
+
+}  // namespace
+
+size_t direct_read_chunk_bytes() {
+    static const size_t bytes = env_kb_to_bytes("GPU_MOE_OTD_READ_CHUNK_KB", 128);
+    return bytes;
+}
+
+size_t coalesce_limit_bytes() {
+    static const size_t bytes = env_kb_to_bytes("GPU_MOE_OTD_COALESCE_KB", 0);
+    return bytes;
 }
 
 OtdPerfCounters* get_perf_counters() {
@@ -565,6 +592,44 @@ void execute_direct_host_load(const cldnn::MOECompressed::Config& config,
         context.staging(),
         get_perf_counters(),
         load.counts_as_tensor);
+}
+
+void execute_coalesced_host_loads(const cldnn::MOECompressed::Config& config,
+                                  const std::vector<HostTensorLoad>& loads,
+                                  const std::vector<size_t>& indices,
+                                  const std::filesystem::path& weights_path,
+                                  IoWorkerContext& context) {
+    OPENVINO_ASSERT(!indices.empty(), "Empty OTD coalesced load");
+    const auto& first = loads[indices.front()];
+    const auto& last = loads[indices.back()];
+    const size_t start = first.file_offset;
+    const size_t total = last.file_offset + last.size - start;
+    auto* perf = get_perf_counters();
+
+    const char* src = nullptr;
+    {
+        ScopedOtdTimer timer(perf ? &perf->disk_io_ns : nullptr);
+        src = context.read_view(weights_path, total, start);
+    }
+    for (size_t index : indices) {
+        const auto& load = loads[index];
+        load_tensor_to_host(
+            config,
+            load.offset_pos,
+            load.data_type,
+            load.dst,
+            load.size,
+            load.file_offset,
+            [&](char* dst, size_t size, size_t file_offset) {
+                std::memcpy(dst, src + (file_offset - start), size);
+            },
+            context.staging(),
+            perf,
+            load.counts_as_tensor);
+    }
+    if (perf) {
+        perf->coalesced_loads.fetch_add(indices.size() - 1, std::memory_order_relaxed);
+    }
 }
 
 }  // namespace ov::intel_gpu::ocl::moe_otd

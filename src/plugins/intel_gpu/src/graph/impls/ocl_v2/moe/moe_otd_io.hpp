@@ -32,12 +32,29 @@ public:
 
     void read(const std::filesystem::path& path, char* dst, size_t size, size_t file_offset);
 
+    // Returns a pointer to the requested bytes, valid until the next read on this context.
+    const char* read_view(const std::filesystem::path& path, size_t size, size_t file_offset);
+
     std::vector<uint8_t>& staging() {
         return _staging;
     }
 
 private:
+    struct DirectFile {
+        std::filesystem::path path;
+        ov::FileHandle handle;
+        size_t size;
+    };
+
+    DirectFile& direct_file(const std::filesystem::path& path);
+    const char* read_direct_span(DirectFile& file, size_t size, size_t file_offset);
+    void read_buffered(const std::filesystem::path& path, char* dst, size_t size, size_t file_offset);
+    void read_direct(const std::filesystem::path& path, char* dst, size_t size, size_t file_offset);
+
     std::vector<std::pair<std::filesystem::path, ov::FileHandle>> _handles;
+    std::vector<DirectFile> _direct_files;
+    std::vector<uint8_t> _direct_buffer;
+    std::vector<uint8_t> _view_buffer;
     std::vector<uint8_t> _staging;
 };
 

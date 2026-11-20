@@ -55,6 +55,8 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> prefill_io_wait_ns{0};
     std::atomic<uint64_t> prefill_slot_stalls{0};
     std::atomic<uint64_t> created_onednn_kernels{0};
+    // Loads served by an adjacent expert's coalesced read instead of their own request.
+    std::atomic<uint64_t> coalesced_loads{0};
 
     void dump() const;
 };
@@ -153,7 +155,11 @@ void fill_weights_memory(cldnn::stream& exec_stream,
 
 // Raw (non-transposed) expert tensors are split into reads of at most this size so that a
 // single missing expert still spreads over several IO workers.
-inline constexpr size_t direct_read_chunk_bytes = 128 * 1024;
+// GPU_MOE_OTD_READ_CHUNK_KB overrides the 128 KiB default; 0 reads each tensor slice in one request.
+size_t direct_read_chunk_bytes();
+
+// GPU_MOE_OTD_COALESCE_KB: max bytes of one merged read over file-adjacent loads; 0 (default) disables merging.
+size_t coalesce_limit_bytes();
 
 // One IO task: reads an expert tensor (or a chunk of a raw weight tensor) straight into its
 // host-USM slot, transposing scale/zp through the worker staging buffer.
@@ -183,5 +189,12 @@ void execute_direct_host_load(const cldnn::MOECompressed::Config& config,
                               const HostTensorLoad& load,
                               const std::filesystem::path& weights_path,
                               IoWorkerContext& context);
+
+// Reads loads[indices] (file-contiguous, in file order) with one request and scatters them to their slots.
+void execute_coalesced_host_loads(const cldnn::MOECompressed::Config& config,
+                                  const std::vector<HostTensorLoad>& loads,
+                                  const std::vector<size_t>& indices,
+                                  const std::filesystem::path& weights_path,
+                                  IoWorkerContext& context);
 
 }  // namespace ov::intel_gpu::ocl::moe_otd

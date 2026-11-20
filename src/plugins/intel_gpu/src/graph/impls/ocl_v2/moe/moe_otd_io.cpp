@@ -7,20 +7,121 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <iterator>
+#include <string_view>
 
 #include "openvino/core/except.hpp"
 #include "openvino/util/parallel_io.hpp"
 
 namespace ov::intel_gpu::ocl::moe_otd {
 
+namespace {
+
+// Covers both 512-byte and 4 KiB logical block sizes.
+constexpr size_t direct_io_alignment = 4096;
+
+// GPU_MOE_OTD_DIRECT_IO=1 bypasses the page cache so expert loads hit the SSD.
+bool direct_io_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GPU_MOE_OTD_DIRECT_IO");
+        return env != nullptr && std::string_view(env) == "1";
+    }();
+    return enabled;
+}
+
+}  // namespace
+
 IoWorkerContext::~IoWorkerContext() {
     for (const auto& entry : _handles) {
         ov::util::close_file_handle(entry.second);
     }
+    for (const auto& file : _direct_files) {
+        ov::util::close_file(file.handle);
+    }
 }
 
 void IoWorkerContext::read(const std::filesystem::path& path, char* dst, size_t size, size_t file_offset) {
+    if (direct_io_enabled()) {
+        read_direct(path, dst, size, file_offset);
+    } else {
+        read_buffered(path, dst, size, file_offset);
+    }
+}
+
+const char* IoWorkerContext::read_view(const std::filesystem::path& path, size_t size, size_t file_offset) {
+    if (direct_io_enabled()) {
+        auto& file = direct_file(path);
+        if (file_offset + size <= (file.size & ~(direct_io_alignment - 1))) {
+            return read_direct_span(file, size, file_offset);
+        }
+    }
+    if (_view_buffer.size() < size) {
+        _view_buffer.resize(size);
+    }
+    auto* dst = reinterpret_cast<char*>(_view_buffer.data());
+    read(path, dst, size, file_offset);
+    return dst;
+}
+
+IoWorkerContext::DirectFile& IoWorkerContext::direct_file(const std::filesystem::path& path) {
+    auto file = std::find_if(_direct_files.begin(), _direct_files.end(), [&](const DirectFile& f) {
+        return f.path == path;
+    });
+    if (file != _direct_files.end()) {
+        return *file;
+    }
+    const auto handle = ov::util::open_file(path, ov::util::FileMode::READ | ov::util::FileMode::DIRECT);
+    OPENVINO_ASSERT(handle != ov::invalid_handle, "Failed to open OTD weight file with direct IO: ", ov::util::path_to_string(path));
+    _direct_files.push_back({path, handle, static_cast<size_t>(std::filesystem::file_size(path))});
+    return _direct_files.back();
+}
+
+// Reads the aligned span covering [file_offset, file_offset + size) into the bounce buffer; the span must not
+// extend past the aligned file size.
+const char* IoWorkerContext::read_direct_span(DirectFile& file, size_t size, size_t file_offset) {
+    constexpr size_t align = direct_io_alignment;
+    const size_t begin = file_offset & ~(align - 1);
+    const size_t end = (file_offset + size + align - 1) & ~(align - 1);
+    const size_t span = end - begin;
+    if (_direct_buffer.size() < span + align) {
+        _direct_buffer.resize(span + align);
+    }
+    const auto base = reinterpret_cast<uintptr_t>(_direct_buffer.data());
+    auto* aligned = reinterpret_cast<char*>((base + align - 1) & ~static_cast<uintptr_t>(align - 1));
+    if (!ov::util::positional_read(file.handle, aligned, span, begin)) {
+        OPENVINO_THROW("Failed to read enough bytes from OTD weight file with direct IO");
+    }
+    return aligned + (file_offset - begin);
+}
+
+void IoWorkerContext::read_direct(const std::filesystem::path& path, char* dst, size_t size, size_t file_offset) {
+    auto& file = direct_file(path);
+    constexpr size_t align = direct_io_alignment;
+    if (reinterpret_cast<uintptr_t>(dst) % align == 0 && file_offset % align == 0 && size % align == 0 &&
+        file_offset + size <= file.size) {
+        if (!ov::util::positional_read(file.handle, dst, size, file_offset)) {
+            OPENVINO_THROW("Failed to read enough bytes from OTD weight file with direct IO");
+        }
+        return;
+    }
+
+    // Direct IO cannot read the unaligned file tail; it falls back to a buffered read.
+    const size_t direct_end = std::min(file_offset + size, file.size & ~(align - 1));
+    if (direct_end > file_offset) {
+        const size_t copied = direct_end - file_offset;
+        std::memcpy(dst, read_direct_span(file, copied, file_offset), copied);
+        dst += copied;
+        file_offset += copied;
+        size -= copied;
+    }
+    if (size > 0) {
+        read_buffered(path, dst, size, file_offset);
+    }
+}
+
+void IoWorkerContext::read_buffered(const std::filesystem::path& path, char* dst, size_t size, size_t file_offset) {
     ov::FileHandle handle = ov::invalid_handle;
     for (const auto& entry : _handles) {
         if (entry.first == path) {
